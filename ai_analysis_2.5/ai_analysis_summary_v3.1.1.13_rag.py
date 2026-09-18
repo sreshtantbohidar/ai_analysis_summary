@@ -2876,28 +2876,45 @@ def _match_entity_type_selection_to_dimensions(selected_types) -> tuple:
     matched = []
     unmatched = []
     matched_set = set()
+
+    def _add(name) -> None:
+        if name and name not in matched_set:
+            matched_set.add(name)
+            matched.append(name)
+
     for sel in selections:
         if not sel:
             continue
         sel_words = _entity_type_words(sel)
         sel_stems = {_entity_type_stem(w) for w in sel_words}
         sel_norm = " ".join(sel_words)
-        hit = None
 
         # 1) Exact dimension-name match (case/underscore/punctuation insensitive).
+        #    A dimension name targets exactly that one dimension.
+        exact_dim = None
         for name in OVERALL_ENTITY_TYPE_LABELS:
             if sel_norm == _norm(name):
-                hit = name
+                exact_dim = name
                 break
-        # 2) Exact ES source-field match.
-        if hit is None:
-            for name, fields in all_fields.items():
-                if sel_norm in fields:
-                    hit = name
-                    break
+        if exact_dim:
+            _add(exact_dim)
+            continue
+
+        # 2) Exact ES source-field match. ⭐ A field may legitimately belong to
+        #    several dimensions (e.g. activity_type -> Force Movement AND Training;
+        #    mobile_no -> Force Movement AND Equipment). Match ALL of them so a
+        #    new/never-seen combination list scopes correctly instead of silently
+        #    dropping the later dimensions.
+        field_hits = [name for name, fields in all_fields.items() if sel_norm in fields]
+        if field_hits:
+            for name in field_hits:
+                _add(name)
+            continue
+
         # 3) Word/stem subset of the dimension name ("equipment" -> Equipment and
         #    Vehicle Analysis; "visits" -> Visits and Inspections Analysis).
-        if hit is None and sel_stems:
+        hit = None
+        if sel_stems:
             for name in OVERALL_ENTITY_TYPE_LABELS:
                 name_stems = {_entity_type_stem(w) for w in _entity_type_words(name)}
                 if sel_stems.issubset(name_stems):
@@ -2919,9 +2936,8 @@ def _match_entity_type_selection_to_dimensions(selected_types) -> tuple:
 
         if hit is None:
             unmatched.append(sel)
-        elif hit not in matched_set:
-            matched_set.add(hit)
-            matched.append(hit)
+        else:
+            _add(hit)
     return tuple(matched), tuple(unmatched)
 
 
@@ -3550,7 +3566,16 @@ def fieldwise_overall_analysis(e_hits: list, full_query: str, model_name: str,
     selected_dimension_names, unmatched_selections = _match_entity_type_selection_to_dimensions(
         _normalize_entity_type_selection(selected_entity_types)
     )
-    scope_is_limited = bool(selected_dimension_names or unmatched_selections)
+    # ⭐ Robustness: if the selection contains ONLY unrecognized values, treat it
+    # as no restriction (analyze ALL fields) instead of producing an empty
+    # Overall Analysis — a missing section looks broken to end users.
+    if not selected_dimension_names and unmatched_selections:
+        print(
+            f"[WARN] Overall Analysis: none of the entity_type_analysis values were recognized "
+            f"({', '.join(unmatched_selections)}); analyzing ALL fields instead"
+        )
+        unmatched_selections = ()
+    scope_is_limited = bool(selected_dimension_names)
     # ⭐ v3.1.1.14: scoped runs replace the user's prompt with the built-in
     # entity-type prompt derived from the selected entity types; all-fields
     # runs keep the user's prompt.
