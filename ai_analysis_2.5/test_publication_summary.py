@@ -143,15 +143,15 @@ check("user prompt stripped of NOTE trailer",
       any("PLEASE NOTE" not in str(u) for u in [1]) and calls["question"] == 1)
 check("gemma4 chat model requested", calls["question_models"] == ["gemma4:12b"])
 
-# gemma4 rejected -> server default fallback
-print("\n[4] gemma4 rejected -> server default")
+# gemma4 rejected -> known-registered fallback model
+print("\n[4] gemma4 rejected -> registered fallback model")
 calls["question_models"] = []
 
 
 def _post_model_reject(url, headers=None, json=None, timeout=None):
     if url.endswith("/questions"):
         calls["question_models"].append(json.get("model_name"))
-        if json.get("model_name"):
+        if json.get("model_name") != pub.FALLBACK_REGISTERED_MODEL:
             return _Resp(400, {"error": "model_name 'gemma4:12b' is not registered"})
         return _Resp(202, {"question_id": "Q-2", "status": "queued"})
     return _Resp(202, {"summary_id": "SUM-2", "status": "queued"})
@@ -166,7 +166,8 @@ def _fake_get2(url, headers=None, timeout=None):
 pub.requests.post = _post_model_reject
 pub.requests.get = _fake_get2
 pub.build_publication_summary_section(HITS, "prompt")
-check("fallback retried without model_name", calls["question_models"] == ["gemma4:12b", None])
+check("fallback retried with registered model",
+      calls["question_models"] == ["gemma4:12b", pub.FALLBACK_REGISTERED_MODEL])
 
 # ──────────────────────────────────────────────
 # 5. API unreachable -> section skipped

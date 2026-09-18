@@ -59,6 +59,10 @@ ELASTICSEARCH_USERNAME = constants.ELASTICSEARCH_USERNAME
 ELASTICSEARCH_PASSWORD = constants.ELASTICSEARCH_PASSWORD
 
 OLLAMA_TIMEOUT = 900
+
+# ⭐ NEW (robustness): rows that crashed once and were requeued; a second crash
+# marks them done with an error report instead of looping forever.
+_requeued_failed_rows = set()
 MAX_RETRIES = 3
 
 # Fallback model if the configured model returns empty responses
@@ -3843,7 +3847,20 @@ def ai_analysis_summary_check(row, ai_trends, ai_summ, ai_change, ai_change_prev
         elastic_query, ai_analysis_summary_id, search_form_type = row
         selected_entity_types = None
         summary_type_publication = False
-    search_form_type = search_form_type.lower()
+    search_form_type = (search_form_type or "").strip().lower()
+    if not search_form_type:
+        # ⭐ NEW (robustness): a NULL/empty search_form_type used to crash here
+        # (AttributeError) and wedge the row at query_status=2 forever. Write a
+        # visible error report and finish the row cleanly instead.
+        err_html = (
+            "<html><body><h3>AI Analysis Error</h3>"
+            "<p>This request could not be processed: the analysis type "
+            "(search_form_type) is missing for this row. "
+            "Please re-submit the request.</p></body></html>"
+        )
+        update_ai_analysis_summary_query_text(cursor, ai_analysis_summary_id, err_html)
+        print(f"[WARN] Row {ai_analysis_summary_id}: NULL/empty search_form_type — error report written, row marked done")
+        return
     model_prompt_dict = None
     if search_form_type != 'profile analysis':
         model_prompt_dict = get_prompt_and_model(cursor, ai_analysis_summary_id)
@@ -4535,6 +4552,37 @@ def ai_analysis_summary_check_threadsafe(row, ai_trends, ai_summ, ai_change, ai_
     except Exception as e:
         print(f"[ERROR] Error processing row {row}: {e}")
         traceback.print_exc()
+        # ⭐ NEW (robustness): don't leave the row wedged at query_status=2 when
+        # processing crashes (e.g. VPN flap, zombie LLM request). First failure →
+        # requeue for retry; second failure → terminal error report in query_text.
+        try:
+            row_id = row[1] if isinstance(row, (list, tuple)) and len(row) >= 2 else None
+            if row_id is not None:
+                fix_conn = postgres_connection()
+                try:
+                    with fix_conn.cursor() as fix_cur:
+                        if row_id in _requeued_failed_rows:
+                            fix_cur.execute(
+                                "UPDATE public.ai_analysis_summary SET query_status = 1, query_text = %s "
+                                "WHERE ai_analysis_summary_id = %s",
+                                ("<html><body><h3>AI Analysis Error</h3>"
+                                 "<p>Processing failed repeatedly. Please re-submit the request; "
+                                 "see service logs for details.</p></body></html>",
+                                 row_id))
+                            _requeued_failed_rows.discard(row_id)
+                            print(f"[WARN] Row {row_id} failed twice — marked done with error report")
+                        else:
+                            fix_cur.execute(
+                                "UPDATE public.ai_analysis_summary SET query_status = 0 "
+                                "WHERE ai_analysis_summary_id = %s",
+                                (row_id,))
+                            _requeued_failed_rows.add(row_id)
+                            print(f"[WARN] Row {row_id} crashed — requeued for retry")
+                    fix_conn.commit()
+                finally:
+                    fix_conn.close()
+        except Exception as e2:
+            print(f"[ERROR] Failed-row recovery failed: {e2}")
 
 
 def imint_ai_analysis_summary_check_threadsafe(row):
@@ -4638,11 +4686,70 @@ def ensure_connection(conn):
         return postgres_connection()
 
 
+def reset_stale_processing_rows() -> dict:
+    """⭐ NEW (robustness): startup sweep for the hard-kill wedge bug.
+
+    A hard kill (kill -9, power loss, VPN-flap OOM) bypasses the in-process
+    auto-requeue, leaving rows locked at "processing" (query_status/status = 2)
+    forever — a later restart finds nothing to do because the lock queries only
+    select rows at 0, so the wedge persists indefinitely. This sweep runs ONCE
+    at loop startup and resets any row still marked 2 back to 0 (pending).
+    Safe at startup because no instance of ours is mid-row yet.
+
+    Multi-instance deployments: set AI_SUMMARY_NO_RESET_STALE=1 to skip the
+    sweep when another instance may be actively processing rows.
+
+    Returns {"ai_analysis_summary": n, "imint_ai_analysis": n}, or {} on failure.
+    """
+    counts = {}
+    conn = postgres_connection()
+    try:
+        with conn.cursor() as cursor:
+            for table, id_col, status_col in (
+                ("ai_analysis_summary", "ai_analysis_summary_id", "query_status"),
+                ("imint_ai_analysis", "imint_ai_analysis_id", "status"),
+            ):
+                cursor.execute(
+                    f"UPDATE public.{table} SET {status_col} = 0 "
+                    f"WHERE {status_col} = 2"
+                )
+                counts[table] = cursor.rowcount
+        conn.commit()
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[WARN] Startup sweep failed (leaving rows untouched): {exc}")
+        return {}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if any(counts.values()):
+        print(f"[INFO] Startup sweep: reset stale in-progress rows to pending: "
+              f"ai_analysis_summary={counts['ai_analysis_summary']}, "
+              f"imint_ai_analysis={counts['imint_ai_analysis']}")
+    else:
+        print("[INFO] Startup sweep: no stale in-progress rows found")
+    return counts
+
+
 def run_ai_analysis_summary_loop(ai_trends, ai_summ, ai_change, ai_change_previous, poll_interval,
                                  chunk_token_threshold=3000, chunk_size=2200,
                                  chunk_output_tokens=800, consolidation_output_tokens=1500,
-                                 llm_context_tokens=None, chunk_workers_arg=None):                                
+                                 llm_context_tokens=None, chunk_workers_arg=None):                               
     conn = postgres_connection()
+
+    # ⭐ NEW (robustness): one-time startup sweep — rows wedged at "processing"
+    # by a previously hard-killed instance are reset to pending so they are not
+    # silently lost. Skip with AI_SUMMARY_NO_RESET_STALE=1 for multi-instance.
+    if os.getenv("AI_SUMMARY_NO_RESET_STALE", "") not in ("1", "true", "True"):
+        try:
+            reset_stale_processing_rows()
+        except Exception as sweep_exc:
+            print(f"[WARN] Startup sweep error: {sweep_exc}")
 
     while True:
         try:
@@ -4753,6 +4860,10 @@ def call_main_func():
     parser.add_argument('--chunk_target_tokens', '--chunk-target-tokens', type=int, default=None, metavar='N',
                         help='Optional direct target size for each uploaded chunk document in estimated tokens. '
                              'Default scales from context using a quality-oriented fraction and remains bounded.')
+    parser.add_argument('--no_reset_stale', action='store_true',
+                        help='Skip the startup sweep that resets rows wedged at "processing" by a '
+                             'previously hard-killed instance. Set this when another pipeline '
+                             'instance is already running against the same database.')
     args = parser.parse_args()
 
     ai_summ = False
@@ -4848,6 +4959,9 @@ def call_main_func():
     print(f"  Combined-analysis context budget: {int(llm_context_tokens * 0.85)} tokens (85% of context)")
     if args.rag_topn is not None and args.rag_topn > 0:
         os.environ["AI_SUMMARY_RAG_TOPN"] = str(args.rag_topn)
+    if args.no_reset_stale:
+        os.environ["AI_SUMMARY_NO_RESET_STALE"] = "1"
+        print("  Startup sweep: DISABLED (--no_reset_stale) — stale in-progress rows left untouched")
     resolved_chunk_workers = _resolve_chunk_workers(args.chunk_workers)
     print(f"  Chunk workers: {resolved_chunk_workers}")
     print(f"  RAG topN: {os.getenv('AI_SUMMARY_RAG_TOPN', f'dynamic up to {DEFAULT_RAG_TOP_N}')} (legacy per-chunk path)")

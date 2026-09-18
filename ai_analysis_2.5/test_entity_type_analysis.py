@@ -506,5 +506,68 @@ check("fallback returns legacy 3-tuple rows", rows == [("{}", 1, "General Area A
       f"got {rows}")
 
 # ──────────────────────────────────────────────
+# 7. reset_stale_processing_rows (startup sweep)
+# ──────────────────────────────────────────────
+print("\n[7] startup sweep resets stale processing rows")
+
+
+class _SweepCursor:
+    def __init__(self):
+        self.executed = []
+
+    def execute(self, query, params=None):
+        self.executed.append(" ".join(query.split()))
+        # rowcount: 3 stale summary rows, 1 stale imint row
+        self.rowcount = 3 if "ai_analysis_summary" in query else 1
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _SweepConn:
+    def __init__(self):
+        self._cursor = _SweepCursor()
+        self.closed = False
+
+    def cursor(self):
+        return self._cursor
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+_sweep_conn = _SweepConn()
+_orig_conn = m.postgres_connection
+try:
+    m.postgres_connection = lambda: _sweep_conn
+    counts = m.reset_stale_processing_rows()
+finally:
+    m.postgres_connection = _orig_conn
+
+check("sweep returns per-table counts",
+      counts == {"ai_analysis_summary": 3, "imint_ai_analysis": 1}, f"got {counts}")
+check("sweep resets query_status on ai_analysis_summary",
+      any("UPDATE public.ai_analysis_summary SET query_status = 0 WHERE query_status = 2" in q
+          for q in _sweep_conn._cursor.executed),
+      f"executed: {_sweep_conn._cursor.executed}")
+check("sweep resets status on imint_ai_analysis",
+      any("UPDATE public.imint_ai_analysis SET status = 0 WHERE status = 2" in q
+          for q in _sweep_conn._cursor.executed))
+check("sweep closes its connection", _sweep_conn.closed)
+
+check("--no_reset_stale flag exists",
+      "--no_reset_stale" in open("ai_analysis_summary_v3.1.1.13_rag.py").read(),
+      "flag wiring missing")
+
+# ──────────────────────────────────────────────
 print(f"\n{'=' * 50}\nRESULT: {PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

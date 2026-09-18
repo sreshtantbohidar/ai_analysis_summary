@@ -48,9 +48,11 @@ USER_AGENT = "ai-analysis-pipeline/1.0"
 SUMMARY_SECTION_TITLE = "Publication Summary"
 
 # ⭐ v3.1.1.15: preferred chat model for the follow-up question. gemma4 is used
-# when available/registered; if the API rejects it the client retries once
-# without model_name so the server default is used instead.
+# when available/registered; if the API rejects it the client retries once with
+# the known-registered server model (8998 requires an exact registered name —
+# omitting model_name is itself a 400 there).
 PREFERRED_CHAT_MODEL = "gemma4:12b"
+FALLBACK_REGISTERED_MODEL = os.getenv("SUMMARY_API_FALLBACK_MODEL", "llama3:8b-instruct-q8_0")
 
 
 def _api_base() -> str:
@@ -207,9 +209,10 @@ def submit_summary(e_hits: list, page_name: str, filter_json: Optional[dict],
                 print(f"[WARN] Publication summary: submit response without summary_id: {body}")
                 return None
             if r.status_code == 400 and "model" in r.text.lower() and payload.get("model_name"):
-                # Registered model_name mismatch — retry with the server default.
-                print(f"[WARN] Publication summary submit rejected model '{payload['model_name']}'; retrying without model_name")
-                payload.pop("model_name", None)
+                # Registered model_name mismatch — retry with the known-registered
+                # server model (the 8998 API requires an exact registered name).
+                print(f"[WARN] Publication summary submit rejected model '{payload['model_name']}'; retrying with '{FALLBACK_REGISTERED_MODEL}'")
+                payload["model_name"] = FALLBACK_REGISTERED_MODEL
                 continue
             print(f"[WARN] Publication summary submit status {r.status_code}: {r.text[:200]}")
             return None
@@ -272,9 +275,9 @@ def ask_question(summary_id: str, message: str, scope: str = "data",
             question_id = r.json().get("question_id")
         elif r.status_code == 400 and "model" in r.text.lower() and payload.get("model_name"):
             # gemma4 (or the configured chat model) is not registered — retry with
-            # the server default chat model.
-            print(f"[WARN] Publication chat model '{payload['model_name']}' rejected; retrying with server default")
-            payload.pop("model_name", None)
+            # the known-registered server chat model.
+            print(f"[WARN] Publication chat model '{payload['model_name']}' rejected; retrying with '{FALLBACK_REGISTERED_MODEL}'")
+            payload["model_name"] = FALLBACK_REGISTERED_MODEL
             try:
                 r = requests.post(f"{base}/questions", headers=_headers(), json=payload,
                                   timeout=HTTP_TIMEOUT)
