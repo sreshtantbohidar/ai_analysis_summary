@@ -195,9 +195,9 @@ try:
     # Location Analysis source fields. Scoping restricts SECTIONS, not record membership.
     check("scoped run covers location citations (1, 2, 4)", captured.get("Location Analysis") == [1, 2, 4],
           f"got {captured.get('Location Analysis')}")
-    check("scoped run uses the HARDCODED entity-type prompt",
-          "SELECTED ENTITY TYPES AND FIELDS" in captured["__queries__"].get("Location Analysis", "")
-          and "location_name" in captured["__queries__"].get("Location Analysis", ""),
+    check("scoped run uses the USER/DB prompt (not a hardcoded one)",
+          captured["__queries__"].get("Location Analysis", "") == "q"
+          and "SELECTED ENTITY TYPES AND FIELDS" not in captured["__queries__"].get("Location Analysis", ""),
           f"got {captured['__queries__'].get('Location Analysis', '')[:200]}")
 
     # 3c. selection whose dimension matches NO record -> no sections, empty output
@@ -341,12 +341,10 @@ print("\n[3j] sanitize_ai_report_text funnels the HTML repair")
 check("chunk-level markdown fixed via sanitize_ai_report_text",
       "<li>point</li>" in m.sanitize_ai_report_text("- point\n"))
 
-print("\n[4b] hardcoded prompt builder")
-hardcoded = m._build_entity_type_hardcoded_prompt(("Location Analysis", "Visits and Inspections Analysis"))
-check("hardcoded prompt lists entity types", "Location Analysis" in hardcoded
-      and "Visits and Inspections Analysis" in hardcoded)
-check("hardcoded prompt lists fields", "location_name" in hardcoded and "purpose" in hardcoded)
-check("hardcoded prompt has citations instruction", "Citation No. values in parentheses" in hardcoded)
+print("\n[4b] DB prompt used for scoped runs (no hardcoded substitution)")
+check("no hardcoded prompt builder exists",
+      not hasattr(m, "_build_entity_type_hardcoded_prompt"),
+      "_build_entity_type_hardcoded_prompt should be removed")
 
 # ──────────────────────────────────────────────
 # 5. ai_analysis_summary_check row unpacking (3- and 4-tuple)

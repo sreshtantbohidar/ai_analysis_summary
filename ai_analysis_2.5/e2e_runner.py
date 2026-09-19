@@ -4960,5 +4960,12 @@ def call_main_func():
 
 
 if __name__ == '__main__':
-    while True:
+    # E2E runner: process pending rows once, then exit cleanly.
+    try:
         call_main_func()
+    except SystemExit as _e:
+        # poll loop finished its pass (or validation refused); run() returns
+        # normally in the success path, so SystemExit here means validation failed.
+        if _e.code not in (None, 0):
+            raise
+        sys.exit(0)
