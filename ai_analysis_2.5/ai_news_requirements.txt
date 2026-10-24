@@ -1,0 +1,33 @@
+# Runtime dependencies for ai_analysis_report_generator.py
+#
+# Tested against the D:\work\tectum\ai-env virtual environment
+# (Python 3.x, Windows). ai-env ships with most of these already
+# installed; only `requests` and `tqdm` need to be added.
+#
+# Install everything in one go:
+#     D:\work\tectum\ai-env\Scripts\python.exe -m pip install -r requirements.txt
+#
+# Pin loosely (compatible-release operator) so security patches still flow
+# through. Tighten once the project settles on a baseline.
+
+# --- Elasticsearch client (7.x) ---
+# 7.17.x is the last line that supports the legacy scroll API used by
+# `helpers.scan` in tab_report_build(). 8.x moved to PIT; staying on 7.17
+# keeps the existing query path working without rewriting the scroll loop.
+elasticsearch>=7.17.0,<8.0.0
+
+# --- Postgres driver ---
+# psycopg2-binary is the wheel-installable build; no compiler needed on Windows.
+psycopg2-binary>=2.9.0,<3.0.0
+
+# --- HTTP client for AnythingLLM ---
+# Not present in ai-env by default; install explicitly.
+requests>=2.31.0,<3.0.0
+
+# --- Optional but used for progress bars in the ES scan helper ---
+tqdm>=4.66.0,<5.0.0
+
+# --- Transitive / not strictly required, listed for reproducibility ---
+# (Already present in ai-env. Keep pinned versions in case the env is rebuilt.)
+urllib3>=2.0.0,<3.0.0
+certifi>=2023.0.0

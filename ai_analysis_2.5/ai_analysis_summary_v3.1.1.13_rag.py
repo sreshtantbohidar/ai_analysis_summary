@@ -2003,7 +2003,8 @@ def analyze_chunk_direct_chat(chunk_rows: list, chunk_idx: int, total_chunks: in
                               start_row_idx: int, query: str, llm_model: str,
                               latest_evidence_date: Optional[str] = None,
                               context_tokens: Optional[int] = None,
-                              output_tokens: Optional[int] = None) -> str:
+                              output_tokens: Optional[int] = None,
+                              include_citations: bool = True) -> str:
     """Analyze a complete bounded chunk with stateless direct Ollama chat.
 
     The full chunk document is included inline in the request. This is
@@ -2013,6 +2014,11 @@ def analyze_chunk_direct_chat(chunk_rows: list, chunk_idx: int, total_chunks: in
 
     The function is safe for parallel workers because each request is
     independent and does not share AnythingLLM workspace conversation history.
+
+    ⭐ NEW (v3.1.1.17): include_citations=False drops the CITATION REQUIREMENT
+    from the prompt so the model does not add parenthesized citation numbers
+    to the generated text. Evidence records keep their numbers because other
+    pipeline stages rely on the stable Citation No. ordering.
     """
     if not chunk_rows or not llm_model:
         return ""
@@ -2047,12 +2053,20 @@ def analyze_chunk_direct_chat(chunk_rows: list, chunk_idx: int, total_chunks: in
         "an internal record-by-record coverage check and ensure each supplied record has been considered "
         "for task relevance. STRICT PROMPT SCOPE: answer the user's request exactly as written. Do not "
         "introduce a different task, fixed domain template, or analysis category unless the user requested it.\n"
-        "CITATION REQUIREMENT: Each supplied record has a Citation No. Use those numbers to cite the "
-        "source of each analytical point. At the end of each distinct analytical point or paragraph, append "
-        "the supporting citation numbers in parentheses, for example (3, 45, 50). Use only citation numbers "
-        "that actually support that point. If a point is supported by several records, include all relevant "
-        "citation numbers. Do not invent citation numbers.\n"
-        "OUTPUT REQUIREMENT: Return a concise, evidence-based answer to the user's request. "
+        # ⭐ NEW (v3.1.1.17): the CITATION REQUIREMENT is included only when the
+        # row's is_citation flag is TRUE. When citations are not requested, the
+        # prompt explicitly forbids citation-number lists in the output.
+        + (
+            "CITATION REQUIREMENT: Each supplied record has a Citation No. Use those numbers to cite the "
+            "source of each analytical point. At the end of each distinct analytical point or paragraph, append "
+            "the supporting citation numbers in parentheses, for example (3, 45, 50). Use only citation numbers "
+            "that actually support that point. If a point is supported by several records, include all relevant "
+            "citation numbers. Do not invent citation numbers.\n"
+            if include_citations else
+            "CITATIONS: Do NOT include any citation numbers or parenthesized number lists such as (3, 45, 50) "
+            "in the output. Write the analysis without referencing citation numbers.\n"
+        )
+        + "OUTPUT REQUIREMENT: Return a concise, evidence-based answer to the user's request. "
         "Keep the analysis compact: aggregate repeated observations instead of restating them, "
         "avoid repeating the user's request or announcing section headings that merely restate the "
         "record grouping, and do not pad with routine per-record commentary when several records "
@@ -2080,7 +2094,7 @@ def analyze_chunk_direct_chat(chunk_rows: list, chunk_idx: int, total_chunks: in
         max_output_tokens=output_tokens,
     )
     if response:
-        return sanitize_ai_report_text(response)
+        return sanitize_ai_report_text(response, include_citations=include_citations)
 
     # Last-resort AnythingLLM inline chat. This fallback is used only when the
     # direct Ollama request fails; the normal path never relies on shared chat
@@ -2091,7 +2105,7 @@ def analyze_chunk_direct_chat(chunk_rows: list, chunk_idx: int, total_chunks: in
     )
     fallback = get_llm_response_direct(prompt, llm_model, max_tokens=output_tokens)
     if fallback and len(fallback.strip()) > 20:
-        return sanitize_ai_report_text(fallback.strip())
+        return sanitize_ai_report_text(fallback.strip(), include_citations=include_citations)
     return ""
 
 
@@ -2233,7 +2247,7 @@ def _process_chunk_job(job) -> tuple:
     This avoids semantic-RAG retrieval hiding minority/one-off records.
     AnythingLLM inline chat is retained only as a last-resort fallback.
     """
-    chunk_idx, total_chunks, chunk_info, query, model_name, doc_label, latest_evidence_date = job
+    chunk_idx, total_chunks, chunk_info, query, model_name, doc_label, latest_evidence_date, include_citations = job
     start_time = time.time()
 
     try:
@@ -2247,6 +2261,7 @@ def _process_chunk_job(job) -> tuple:
             latest_evidence_date=latest_evidence_date,
             context_tokens=chunk_info.get("context_tokens"),
             output_tokens=chunk_info.get("output_tokens"),
+            include_citations=include_citations,
         )
     except Exception as exc:
         print(f"[ERROR] Direct chunk {chunk_idx}/{total_chunks} failed: {exc}")
@@ -2507,18 +2522,23 @@ def run_combined_rag_enrichment(chunk_responses, full_query: str, model_name: st
 
 
 
-def sanitize_ai_report_text(text: str) -> str:
+def sanitize_ai_report_text(text: str, include_citations: bool = True) -> str:
     """Normalize report-facing wording without changing source data.
 
     The report should consistently use 'analysis'/'aggregation' terminology.
     This is applied only to generated AI prose, never to the underlying ES
     records or citation table values.
+
+    ⭐ NEW (v3.1.1.17): include_citations=False skips the "Citations:" line
+    normalization so a stray model-emitted citation line is not converted into
+    a polished <p>Citations: ...</p> report paragraph when citations were not
+    requested.
     """
     if not text:
         return text
     # ⭐ v3.1.1.14: repair LLM output defects (raw markdown headings/bullets,
     # broken </ul closes, bold "Citations:" lines) before any rewording.
-    text = _sanitize_llm_section_html(text)
+    text = _sanitize_llm_section_html(text, include_citations=include_citations)
     replacements = [
         (r"(?i)\bSummaries\b", "Analyses"),
         (r"(?i)\bSummary\b", "Analysis"),
@@ -3123,8 +3143,15 @@ def _build_dimension_groups(e_hits: list) -> list:
     return dimensions
 
 
-def _render_dimension_records(records: list, include_all_fields: bool = False) -> str:
-    """Render source records for a dimension, preserving citation numbers."""
+def _render_dimension_records(records: list, include_all_fields: bool = False,
+                              include_citations: bool = True) -> str:
+    """Render source records for a dimension, preserving citation numbers.
+
+    ⭐ NEW (v3.1.1.17): include_citations=False renames the per-record heading
+    from "### Citation No. N" to "### Record N" so the evidence document does
+    not use citation wording. Record numbering is preserved because downstream
+    stages rely on the stable record order.
+    """
     if not records:
         return ""
     blocks = []
@@ -3141,7 +3168,11 @@ def _render_dimension_records(records: list, include_all_fields: bool = False) -
         source = hit.get("_source", {}) if isinstance(hit, dict) else {}
         if not isinstance(source, dict):
             source = {}
-        lines = [f"### Citation No. {citation_no}"]
+        # ⭐ NEW (v3.1.1.17): heading wording depends on the is_citation flag.
+        # Records keep a numbered heading (a needed visual boundary between
+        # evidence blocks) but without the "Citation" wording when citations
+        # are not requested.
+        lines = [f"### Citation No. {citation_no}"] if include_citations else [f"### Record {citation_no}"]
         keys = list(source.keys()) if include_all_fields else [f for f in preferred if f in source]
         seen = set()
         for field in keys:
@@ -3183,7 +3214,7 @@ def _batch_dimension_groups(groups: list, context_limit_tokens: int, fixed_promp
     return batches
 
 
-def _sanitize_llm_section_html(response: str) -> str:
+def _sanitize_llm_section_html(response: str, include_citations: bool = True) -> str:
     """Repair common LLM output defects before the section reaches the report.
 
     ⭐ v3.1.1.14 fix — found in the all-fields large-volume report:
@@ -3242,16 +3273,20 @@ def _sanitize_llm_section_html(response: str) -> str:
     text = "\n".join(out_lines)
 
     # -- 3) Normalize bold 'Citations:' lines to plain weight ----------------
-    text = re.sub(
-        r"(?i)<p>\s*<strong>\s*Citations\s*:\s*</strong>\s*(\([^)]*\))\s*</p>",
-        r"<p>Citations: \1</p>",
-        text,
-    )
-    text = re.sub(
-        r"(?i)<strong>\s*Citations\s*:\s*</strong>\s*(\([^)]*\))",
-        r"Citations: \1",
-        text,
-    )
+    # ⭐ v3.1.1.17: skipped when include_citations is False — when citations
+    # were not requested, a stray model-emitted "Citations:" line is not
+    # normalized into a polished report paragraph.
+    if include_citations:
+        text = re.sub(
+            r"(?i)<p>\s*<strong>\s*Citations\s*:\s*</strong>\s*(\([^)]*\))\s*</p>",
+            r"<p>Citations: \1</p>",
+            text,
+        )
+        text = re.sub(
+            r"(?i)<strong>\s*Citations\s*:\s*</strong>\s*(\([^)]*\))",
+            r"Citations: \1",
+            text,
+        )
     return text
 
 
@@ -3315,7 +3350,8 @@ def _strip_dimension_name_echo(dimension_name: str, response: str) -> str:
 
 def _analyze_overall_dimension_batch(dimension_name: str, groups: list, full_query: str,
                                      model_name: str, llm_context_tokens: int,
-                                     latest_evidence_date: Optional[str] = None) -> str:
+                                     latest_evidence_date: Optional[str] = None,
+                                     include_citations: bool = True) -> str:
     """Analyze one field-wise group batch directly from original ES records."""
     if not groups:
         return ""
@@ -3326,10 +3362,24 @@ def _analyze_overall_dimension_batch(dimension_name: str, groups: list, full_que
         citations_all.extend(group["citations"])
         group_blocks.append(
             f"\n===== {dimension_name.upper()} VALUE: {group['label']} =====\n"
-            f"{_render_dimension_records(group['records'])}\n"
+            f"{_render_dimension_records(group['records'], include_citations=include_citations)}\n"
             f"===== END VALUE: {group['label']} =====\n"
         )
     evidence = "\n".join(group_blocks).strip()
+
+    # ⭐ NEW (v3.1.1.17): citation wording depends on the is_citation flag.
+    # Extracted before the f-string so both the evidence framing and the
+    # CITATIONS instruction switch cleanly.
+    _record_word = "Citation No." if include_citations else "Record"
+    _citation_rule = (
+        "End each distinct analytical point or paragraph with the supporting Citation\n"
+        "No. values in parentheses, for example (3, 45, 50). Use only citation numbers\n"
+        "actually present in the supplied evidence."
+        if include_citations else
+        "Do NOT include any citation numbers or parenthesized number lists such as\n"
+        "(3, 45, 50) in the output. Write the analysis without referencing citation\n"
+        "numbers."
+    )
 
     prompt = f"""
 You are producing one section of an Overall Analysis directly from the
@@ -3352,7 +3402,7 @@ observations while retaining distinct dates, locations, units, equipment,
 vehicles, quantities and context.
 
 COVERAGE:
-Every supplied Citation No. must be considered. Do not omit a record because
+Every supplied {_record_word} must be considered. Do not omit a record because
 it is less prominent, unique, repeated, or appears in only one value/group.
 Do not invent information or merge distinct facts into a vague statement.
 
@@ -3362,9 +3412,7 @@ that repeats the analytical dimension name "{dimension_name}" — it is already
 shown as the section title.
 
 CITATIONS:
-End each distinct analytical point or paragraph with the supporting Citation
-No. values in parentheses, for example (3, 45, 50). Use only citation numbers
-actually present in the supplied evidence.
+{_citation_rule}
 
 STYLE:
 Produce a compact but detailed analysis; aggregate repeated observations and
@@ -3411,8 +3459,9 @@ SOURCE RECORDS:
         return ""
     # ⭐ v3.1.1.14 fix: drop an LLM-echoed copy of the section title so the
     # report does not show the dimension name twice.
-    cleaned = _sanitize_llm_section_html(response)
-    cleaned = sanitize_ai_report_text(_strip_wrappers(cleaned).strip())
+    cleaned = _sanitize_llm_section_html(response, include_citations=include_citations)
+    cleaned = sanitize_ai_report_text(_strip_wrappers(cleaned).strip(),
+                                      include_citations=include_citations)
     cleaned = _strip_dimension_name_echo(dimension_name, cleaned)
     return cleaned
 
@@ -3476,27 +3525,17 @@ def _render_master_analysis(rows_total: int, n_chunks_done: int,
     ⭐ v3.1.1.16 fix (production feedback): a single-chunk run no longer
     renders a "Chunk Analysis 1" heading — the chunk content is emitted
     directly after the Overall Analysis. Multi-chunk runs keep the numbered
-    chunk headings and the per-run chunk count note.
+    chunk headings.
     """
-    if n_chunks_done > 1:
-        intro = (
-            "<p style=\"color:#6c757d;font-size:13px;\">"
-            f"{rows_total} records were analyzed across {n_chunks_done} chunks, with up to "
-            f"{max_rows_per_chunk_actual} records per chunk.</p>"
-        )
-    else:
-        intro = (
-            "<p style=\"color:#6c757d;font-size:13px;\">"
-            f"{rows_total} records were analyzed.</p>"
-        )
     overall_block = overall_html if overall_html else "<h2>Overall Analysis</h2><p>Analysis could not be generated.</p>"
-    return "<div>" + intro + overall_block + chunk_html + "</div><br>"
+    return "<div>" + overall_block + chunk_html + "</div><br>"
 
 
 def fieldwise_overall_analysis(e_hits: list, full_query: str, model_name: str,
                                llm_context_tokens: int,
                                latest_evidence_date: Optional[str] = None,
-                               selected_entity_types=None) -> str:
+                               selected_entity_types=None,
+                               include_citations: bool = True) -> str:
     """Build Overall Analysis as concatenated field-wise analyses from original ES records.
 
     This deliberately does not analyze chunk responses. The original records
@@ -3586,14 +3625,16 @@ def fieldwise_overall_analysis(e_hits: list, full_query: str, model_name: str,
         for batch_idx, batch in enumerate(batches, 1):
             batch_name = name if len(batches) == 1 else f"{name} — Part {batch_idx} of {len(batches)}"
             result = _analyze_overall_dimension_batch(
-                batch_name, batch, effective_query, model_name, llm_context_tokens, latest_evidence_date
+                batch_name, batch, effective_query, model_name, llm_context_tokens, latest_evidence_date,
+                include_citations=include_citations
             )
             batch_citations = sorted({citation for group in batch for citation in group["citations"]})
             if result:
                 # ⭐ v3.1.1.14 fix: append the Citations tail only when the model
                 # did not already emit one — previously both appeared. Plain weight
                 # (not bold) per report style; sanitizer normalizes model-bold ones.
-                if not re.search(r"(?i)Citations\s*:", result):
+                # ⭐ v3.1.1.17: the tail is appended ONLY when is_citation is TRUE.
+                if include_citations and not re.search(r"(?i)Citations\s*:", result):
                     citation_tail = "(" + ", ".join(str(n) for n in batch_citations) + ")" if batch_citations else ""
                     if citation_tail:
                         result = result + f"<p>Citations: {citation_tail}</p>"
@@ -3617,7 +3658,7 @@ def fieldwise_overall_analysis(e_hits: list, full_query: str, model_name: str,
                           "records": [(n, e_hits[n - 1]) for n in unmatched_citations]}
         result = _analyze_overall_dimension_batch(
             "Other Relevant Records", [fallback_group], effective_query, model_name,
-            llm_context_tokens, latest_evidence_date
+            llm_context_tokens, latest_evidence_date, include_citations=include_citations
         )
         if result:
             sections.append(f"<h2>Other Relevant Analysis</h2><div>{result}</div>")
@@ -3646,7 +3687,8 @@ def synthesize_combined_analysis(chunk_responses, full_query, model_name,
                                  max_levels=None, output_tokens=None,
                                  raw_evidence_document: str = "",
                                  raw_evidence_hits: Optional[list] = None,
-                                 selected_entity_types=None) -> str:
+                                 selected_entity_types=None,
+                                 include_citations: bool = True) -> str:
     """Backward-compatible entry point for the Overall Analysis.
 
     The Overall Analysis is now field-wise and record-driven. It analyzes the
@@ -3658,12 +3700,16 @@ def synthesize_combined_analysis(chunk_responses, full_query, model_name,
     ai_analysis_summary.entity_type_analysis value. None/empty -> analyze ALL
     entity types (legacy behavior); a non-empty list restricts the Overall
     Analysis to the selected entity types only.
+
+    ⭐ NEW (v3.1.1.17): include_citations carries the row's is_citation flag;
+    when False the generated analysis does not mention citation numbers.
     """
     if raw_evidence_hits:
         return fieldwise_overall_analysis(
             raw_evidence_hits, full_query, model_name, llm_context_tokens,
             latest_evidence_date=latest_evidence_date,
-            selected_entity_types=selected_entity_types
+            selected_entity_types=selected_entity_types,
+            include_citations=include_citations
         )
 
     # Compatibility fallback for callers that do not have the original hit
@@ -3819,16 +3865,27 @@ def ai_analysis_summary_check(row, ai_trends, ai_summ, ai_change, ai_change_prev
                               llm_context_tokens=None, chunk_workers_arg=None):
     # ⭐ NEW (v3.1.1.14/15): row carries entity_type_analysis and
     # summary_type_publication (5-tuple), or a legacy shorter shape.
-    if len(row) >= 5:
+    # ⭐ NEW (v3.1.1.17): 6-tuple rows also carry is_citation. Citations are
+    # included in the report ONLY when is_citation is TRUE.
+    if len(row) >= 6:
+        (elastic_query, ai_analysis_summary_id, search_form_type,
+         selected_entity_types, summary_type_publication, is_citation) = row[:6]
+    elif len(row) >= 5:
         (elastic_query, ai_analysis_summary_id, search_form_type,
          selected_entity_types, summary_type_publication) = row[:5]
+        is_citation = False
     elif len(row) == 4:
         elastic_query, ai_analysis_summary_id, search_form_type, selected_entity_types = row[:4]
         summary_type_publication = False
+        is_citation = False
     else:
         elastic_query, ai_analysis_summary_id, search_form_type = row
         selected_entity_types = None
         summary_type_publication = False
+        is_citation = False
+    include_citations = bool(is_citation)
+    if not include_citations:
+        print(f"[INFO] Row {ai_analysis_summary_id}: is_citation is FALSE — report will not mention citations")
     search_form_type = (search_form_type or "").strip().lower()
     if not search_form_type:
         # ⭐ NEW (robustness): a NULL/empty search_form_type used to crash here
@@ -4119,6 +4176,8 @@ def ai_analysis_summary_check(row, ai_trends, ai_summ, ai_change, ai_change_prev
                 chunk_responses_by_idx = {}
                 chunk_loop_start = time.time()
 
+                # ⭐ NEW (v3.1.1.17): the 8-tuple job also carries the row's
+                # is_citation flag so chunk prompts honor it.
                 jobs = [
                     (
                         idx,
@@ -4128,6 +4187,7 @@ def ai_analysis_summary_check(row, ai_trends, ai_summ, ai_change, ai_change_prev
                         model_name,
                         f"{key}_{ai_analysis_summary_id}",
                         latest_evidence_date,
+                        include_citations,
                     )
                     for idx, chunk_info in enumerate(record_chunks, 1)
                 ]
@@ -4147,6 +4207,7 @@ def ai_analysis_summary_check(row, ai_trends, ai_summ, ai_change, ai_change_prev
                         job[4],
                         job[5],
                         job[6],
+                        job[7],
                     )
                     for job in jobs
                 ]
@@ -4241,7 +4302,7 @@ def ai_analysis_summary_check(row, ai_trends, ai_summ, ai_change, ai_change_prev
                         chunk_sections.append(
                             f"{heading}"
                             f"<div>{chunk_html_text}</div>"
-                            f"<p>Citations: {citation_tail}</p>"
+                            + (f"<p>Citations: {citation_tail}</p>" if include_citations else "")
                         )
                     chunk_html = "".join(chunk_sections)
                     rows_total = sum(end - start + 1 for start, end, _ in chunk_responses)
@@ -4260,36 +4321,9 @@ def ai_analysis_summary_check(row, ai_trends, ai_summ, ai_change, ai_change_prev
                             raw_evidence_document=build_overall_source_document(e_hits),
                             raw_evidence_hits=e_hits,
                             selected_entity_types=selected_entity_types,
+                            include_citations=include_citations,
                         )
                         if overall_response:
-                            if is_general_analysis:
-                                stats_text = (
-                                    f"Elasticsearch returned {dedup_stats.get('total', rows_total)} raw records. "
-                                    f"After latest-record grouping by form_id and general deduplication, "
-                                    f"{rows_total} records were retained for analysis."
-                                )
-                            else:
-                                stats_text = (
-                                    f"Elasticsearch returned {dedup_stats.get('total', rows_total)} records, "
-                                    f"of which {dedup_stats.get('unique', rows_total)} were unique after analysis filtering "
-                                    f"and {dedup_stats.get('dropped', 0)} duplicates were removed."
-                                )
-                            # ⭐ v3.1.1.14: surface the entity-type scope of this
-                            # Overall Analysis in the report header.
-                            _scope_names, _scope_unmatched = _match_entity_type_selection_to_dimensions(
-                                _normalize_entity_type_selection(selected_entity_types)
-                            )
-                            if _scope_names or _scope_unmatched:
-                                _scope_bits = list(_scope_names) + [
-                                    f"unrecognized: {u}" for u in _scope_unmatched
-                                ]
-                                stats_text += (
-                                    " Overall Analysis is restricted to the selected entity types: "
-                                    + ", ".join(_scope_bits)
-                                    + "."
-                                )
-                            else:
-                                stats_text += " Overall Analysis covers all supported entity types."
                             overall_cited_numbers = _extract_citation_numbers(overall_response, 1, rows_total)
                             if not overall_cited_numbers:
                                 overall_cited_numbers = sorted({
@@ -4302,11 +4336,8 @@ def ai_analysis_summary_check(row, ai_trends, ai_summ, ai_change, ai_change_prev
                             overall_citations = "(" + ", ".join(str(n) for n in overall_cited_numbers) + ")"
                             overall_html = (
                                 "<h2>Overall Analysis</h2>"
-                                "<p style=\"color:#6c757d;font-size:13px;\">"
-                                f"Detailed analysis across all {n_chunks_done} chunks. {stats_text}"
-                                "</p>"
                                 f"<div>{overall_response}</div>"
-                                f"<p>Citations: {overall_citations}</p>"
+                                + (f"<p>Citations: {overall_citations}</p>" if include_citations else "")
                             )
                     except Exception as e:
                         print(f"[WARN] Overall analysis failed: {e}")
@@ -4352,7 +4383,9 @@ def ai_analysis_summary_check(row, ai_trends, ai_summ, ai_change, ai_change_prev
         date_range = extract_date_range(elastic_query)
     doc_table_html = build_doc_id_activity_date_table(
         e_hits, query_total=query_total, date_range=date_range, query_note=query_note
-    ) if e_hits else ""
+    ) if (e_hits and include_citations) else ""
+    if e_hits and not include_citations:
+        print("[INFO] Record Source Details citation table omitted (is_citation is FALSE)")
 
     # ⭐ NEW (v3.1.1.15): Publication Summary — rendered BEFORE the citation
     # table ONLY when summary_type_publication is TRUE. Any API error, timeout
@@ -4513,22 +4546,31 @@ def ai_analysis_summary_check_threadsafe(row, ai_trends, ai_summ, ai_change, ai_
         with conn.cursor() as cursor:
             # ⭐ NEW (v3.1.1.14/15): rows carry entity_type_analysis and
             # summary_type_publication (5-tuple) or a legacy shorter shape.
-            if len(row) >= 5:
+            # ⭐ NEW (v3.1.1.17): 6-tuple rows also carry is_citation; only
+            # rows with is_citation = TRUE include citations in the report.
+            if len(row) >= 6:
+                (filter_json, ai_analysis_summary_id, search_form_type,
+                 selected_entity_types, summary_type_publication, is_citation) = row[:6]
+            elif len(row) >= 5:
                 (filter_json, ai_analysis_summary_id, search_form_type,
                  selected_entity_types, summary_type_publication) = row[:5]
+                is_citation = False
             elif len(row) == 4:
                 filter_json, ai_analysis_summary_id, search_form_type, selected_entity_types = row[:4]
                 summary_type_publication = False
+                is_citation = False
             else:
                 filter_json, ai_analysis_summary_id, search_form_type = row
                 selected_entity_types = None
                 summary_type_publication = False
+                is_citation = False
             ai_analysis_summary_check((filter_json, ai_analysis_summary_id, search_form_type,
-                                       selected_entity_types, bool(summary_type_publication)),
-                           ai_trends, ai_summ, ai_change, ai_change_previous, cursor,
-                           chunk_token_threshold, chunk_size,
-                           chunk_output_tokens, consolidation_output_tokens,
-                           llm_context_tokens, chunk_workers_arg)
+                                       selected_entity_types, bool(summary_type_publication),
+                                       bool(is_citation)),
+                          ai_trends, ai_summ, ai_change, ai_change_previous, cursor,
+                          chunk_token_threshold, chunk_size,
+                          chunk_output_tokens, consolidation_output_tokens,
+                          llm_context_tokens, chunk_workers_arg)
         conn.commit()
         conn.close()
     except Exception as e:
@@ -4583,8 +4625,42 @@ def imint_ai_analysis_summary_check_threadsafe(row):
 def lock_rows_for_processing_1(conn):
     # ⭐ NEW (v3.1.1.14/15): also RETURN entity_type_analysis (jsonb array that
     # scopes the Overall Analysis) and summary_type_publication (bool that adds
-    # the Publication Summary section). Older deployments without these columns
-    # fall back to the legacy 3-column RETURNING shape.
+    # the Publication Summary section).
+    # ⭐ NEW (v3.1.1.17): also RETURN is_citation (bool). Citations appear in
+    # the report ONLY when is_citation is TRUE. Older deployments without the
+    # is_citation column fall back to the 5-column shape, then to the legacy
+    # 3-column RETURNING shape.
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                UPDATE public.ai_analysis_summary
+                SET query_status = 2
+                WHERE ai_analysis_summary_id IN (
+                    SELECT ai_analysis_summary_id
+                    FROM public.ai_analysis_summary
+                    WHERE query_status = 0
+                    ORDER BY ai_analysis_summary_id DESC
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING filter_json, ai_analysis_summary_id, search_form_type,
+                          entity_type_analysis, summary_type_publication, is_citation;
+            """)
+            return cursor.fetchall()
+    except psycopg2.errors.UndefinedColumn:
+        conn.rollback()
+        print("[WARN] is_citation column not found; retrying without it")
+        return _lock_rows_without_is_citation(conn)
+    except psycopg2.ProgrammingError as e:
+        print(f"[ERROR] ProgrammingError in lock_rows_for_processing_1: {e}")
+        return _lock_rows_without_is_citation(conn)
+
+
+def _lock_rows_without_is_citation(conn):
+    """Fallback: RETURN the 5-column shape used before is_citation was added.
+
+    ⭐ v3.1.1.17: rows locked through this path default is_citation to FALSE,
+    so no citations are mentioned in their reports.
+    """
     try:
         with conn.cursor() as cursor:
             cursor.execute("""
@@ -4605,8 +4681,8 @@ def lock_rows_for_processing_1(conn):
         conn.rollback()
         print("[WARN] entity_type_analysis/summary_type_publication columns not found; using legacy row shape")
         return _lock_rows_legacy_shape(conn)
-    except psycopg2.ProgrammingError as e:
-        print(f"[ERROR] ProgrammingError in lock_rows_for_processing_1: {e}")
+    except psycopg2.ProgrammingError as e2:
+        print(f"[ERROR] ProgrammingError in lock_rows_for_processing_1 (5-column fallback): {e2}")
         return _lock_rows_legacy_shape(conn)
 
 

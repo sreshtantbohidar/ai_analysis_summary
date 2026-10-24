@@ -9,7 +9,7 @@ import time
 import tempfile
 import base64
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 import pandas as pd
@@ -349,7 +349,7 @@ def build_doc_id_activity_date_table(hits, query_total=None, date_range=None) ->
         parts = [p for p in re.split(r"[\\/]", s) if p]
         return parts[-1] if parts else ""
 
-    headers = ["Elastic Doc ID", "Source Type", "File Name", "Ingester Name", "Activity Date"]
+    headers = ["Source Type", "File Name", "Activity Date"]
     rows = []
     for hit in hits:
         es_id = hit.get("_id", "") if isinstance(hit, dict) else ""
@@ -366,10 +366,8 @@ def build_doc_id_activity_date_table(hits, query_total=None, date_range=None) ->
         activity_date = source.get("activity_date", "")
 
         rows.append([
-            _esc(es_id),
             _esc(source_type),
             _esc(file_name),
-            _esc(ingester_name),
             _esc(activity_date),
         ])
 
@@ -599,8 +597,7 @@ def query_anythingllm_rag(query: str, llm_model: str) -> str:
 
     payload = {
         "message": query.replace("\n", " ").strip(),
-        "mode": "query",
-        "reset": True
+        "mode": "query"
     }
 
     for attempt in range(MAX_RETRIES):
@@ -960,7 +957,7 @@ def upload_chunk_and_query_rag(chunk_rows: list, chunk_idx: int, total_chunks: i
             try:
                 r = requests.post(
                     chat_url, headers=headers,
-                    json={"message": scoped_query.replace("\n", " ").strip(), "mode": "query", "reset": True},
+                    json={"message": scoped_query.replace("\n", " ").strip(), "mode": "query"},
                     timeout=OLLAMA_TIMEOUT,
                 )
                 if r.status_code == 200:
@@ -1005,7 +1002,7 @@ def _fallback_chat_with_inline(markdown_content: str, query: str, llm_model: str
     return get_llm_response_direct(combined_prompt, llm_model)
 
 
-def get_llm_response_direct(query: str, llm_model: str, max_tokens: int = 1200) -> str:
+def get_llm_response_direct(query: str, llm_model: str, max_tokens=None) -> str:
     """Direct chat mode: sends the prompt as-is to the AnythingLLM workspace chat API.
     
     If the configured model returns an empty response ("text response was empty"),
@@ -1021,9 +1018,7 @@ def get_llm_response_direct(query: str, llm_model: str, max_tokens: int = 1200) 
         update_anythingllm_workspace_model(model)
         payload = {
             "message": query.replace("\n", " ").strip(),
-            "mode": "chat",
-            "reset": True,
-            "maxTokens": max_tokens
+            "mode": "chat"
         }
         try:
             r = requests.post(chat_url, json=payload, headers=headers, timeout=timeout)
@@ -1383,7 +1378,8 @@ def _build_dedup_key(source: dict, dedup_fields: list) -> str:
 
 
 def generic_es_scroll(client: Elasticsearch, index_name: str, base_query_json: dict,
-                      batch_size: int = 1000, keep_alive: str = "2m", dedup_stats: dict = None):
+                      batch_size: int = 1000, keep_alive: str = "2m",
+                      dedup_stats: dict = None, perform_dedup: bool = True):
     """
     Universal Elasticsearch scroll using the classic scroll API.
 
@@ -1403,29 +1399,37 @@ def generic_es_scroll(client: Elasticsearch, index_name: str, base_query_json: d
         collapse_key = collapse_field.get("field", None)
 
     # Always dedup by the composite fields below.
-    dedup_fields = [
-        "description_hash",
-        "comments",
-        "location_name",
-        "activity_type",
-        "activity_date",
-        "enemy_formation_name",
-    ]
-    if collapse_key and collapse_key not in dedup_fields:
-        dedup_fields.append(collapse_key)
-    # Remove duplicates while preserving order
-    seen_fields = set()
-    unique_dedup_fields = []
-    for f in dedup_fields:
-        if f not in seen_fields:
-            seen_fields.add(f)
-            unique_dedup_fields.append(f)
+    if perform_dedup:
+        dedup_fields = [
+            "description_hash",
+            "comments",
+            "location_name",
+            "activity_type",
+            "activity_date",
+            "enemy_formation_name",
+        ]
 
-    if collapse_key:
-        print(f"[INFO] Collapse on '{collapse_key}' — scrolling without collapse, "
-              f"deduplicating by {unique_dedup_fields}")
+        if collapse_key and collapse_key not in dedup_fields:
+            dedup_fields.append(collapse_key)
+
+        # Remove duplicates while preserving order
+        seen_fields = set()
+        unique_dedup_fields = []
+        for f in dedup_fields:
+            if f not in seen_fields:
+                seen_fields.add(f)
+                unique_dedup_fields.append(f)
     else:
-        print(f"[INFO] Deduplicating hits by {unique_dedup_fields}")
+        unique_dedup_fields = []
+
+    if perform_dedup:
+        if collapse_key:
+            print(f"[INFO] Collapse on '{collapse_key}' — scrolling without collapse, "
+                f"deduplicating by {unique_dedup_fields}")
+        else:
+            print(f"[INFO] Deduplicating hits by {unique_dedup_fields}")
+    else:
+        print("[INFO] Deduplication skipped — preserving all Elasticsearch hits")
 
     query["size"] = batch_size
     seen = set()
@@ -1438,14 +1442,20 @@ def generic_es_scroll(client: Elasticsearch, index_name: str, base_query_json: d
         scroll_id = response.get("_scroll_id")
 
         while True:
-            hits = response["hits"]["hits"]
+            hits = response.get("hits", {}).get("hits", [])
             if not hits:
                 break
 
             for hit in hits:
                 total_count += 1
+
+                if not perform_dedup:
+                    yield hit
+                    continue
+
                 source = hit.get("_source", {})
                 dedup_key = _build_dedup_key(source, unique_dedup_fields)
+
                 if dedup_key not in seen:
                     seen.add(dedup_key)
                     yield hit
@@ -1462,8 +1472,12 @@ def generic_es_scroll(client: Elasticsearch, index_name: str, base_query_json: d
             except Exception:
                 pass  # best-effort cleanup
 
-    print(f"[INFO] Scroll dedup: {total_count} total → {len(seen)} unique, "
-          f"dropped {dedup_count} duplicates")
+    if perform_dedup:
+        print(f"[INFO] Scroll dedup: {total_count} total → {len(seen)} unique, "
+            f"dropped {dedup_count} duplicates")
+    else:
+        print(f"[INFO] Scroll complete: {total_count} hits preserved "
+            f"(deduplication skipped)")
     if dedup_stats is not None:
         dedup_stats.update({
             "total": total_count,
@@ -1495,7 +1509,7 @@ def _dedup_hits(hits: list, dedup_fields: list) -> list:
     return result
 
 
-def get_data_from_elastic(elastic_query):
+def get_data_from_elastic(elastic_query, perform_dedup=True):
     """
     Fetch all matching documents from Elasticsearch.
 
@@ -1528,24 +1542,32 @@ def get_data_from_elastic(elastic_query):
         collapse_key = None
         if has_collapse:
             collapse_key = elastic_query.get("collapse", {}).get("field", None)
-        dedup_fields = [
-            "description_hash",
-            "comments",
-            "location_name",
-            "activity_type",
-            "activity_date",
-            "enemy_formation_name",
-        ]
-        if collapse_key and collapse_key not in dedup_fields:
-            dedup_fields.append(collapse_key)
-        # Deduplicate while preserving order
-        _seen = set()
-        unique_dedup_fields = []
-        for f in dedup_fields:
-            if f not in _seen:
-                _seen.add(f)
-                unique_dedup_fields.append(f)
+        if perform_dedup:
+            dedup_fields = [
+                "description_hash",
+                "comments",
+                "location_name",
+                "activity_type",
+                "activity_date",
+                "enemy_formation_name",
+            ]
+
+            if collapse_key and collapse_key not in dedup_fields:
+                dedup_fields.append(collapse_key)
+
+            # Deduplicate while preserving order
+            _seen = set()
+            unique_dedup_fields = []
+
+            for f in dedup_fields:
+                if f not in _seen:
+                    _seen.add(f)
+                    unique_dedup_fields.append(f)
+        else:
+            unique_dedup_fields = []
+        
         dedup_stats = {}
+        # ── Collapse queries: strip collapse, scroll, dedup in Python ──
         # ── Collapse queries: strip collapse, scroll, dedup in Python ──
         if has_collapse:
             all_hits = list(
@@ -1554,10 +1576,14 @@ def get_data_from_elastic(elastic_query):
                     index_name,
                     elastic_query,
                     batch_size=batch_size,
-                    dedup_stats=dedup_stats
+                    dedup_stats=dedup_stats,
+                    perform_dedup=perform_dedup
                 )
             )
-            all_hits = _dedup_hits(all_hits, unique_dedup_fields)
+
+            if perform_dedup:
+                all_hits = _dedup_hits(all_hits, unique_dedup_fields)
+
             return {
                 "hits": {"total": {"value": len(all_hits)}, "hits": all_hits},
                 "dedup_stats": dedup_stats
@@ -1568,9 +1594,13 @@ def get_data_from_elastic(elastic_query):
             response = es.search(index=index_name, body=elastic_query)
             if response.get("hits", {}).get("hits"):
                 raw_hits = response["hits"]["hits"]
-                deduped_hits = _dedup_hits(
-                    raw_hits, unique_dedup_fields
-                )
+
+                if perform_dedup:
+                    deduped_hits = _dedup_hits(
+                        raw_hits, unique_dedup_fields
+                    )
+                else:
+                    deduped_hits = raw_hits
 
                 dedup_stats.update({
                     "total": len(raw_hits),
@@ -1594,7 +1624,8 @@ def get_data_from_elastic(elastic_query):
                 index_name,
                 elastic_query,
                 batch_size=batch_size,
-                dedup_stats=dedup_stats
+                dedup_stats=dedup_stats,
+                perform_dedup=perform_dedup
             )
         )
         result = {
@@ -1660,369 +1691,344 @@ def _combined_estimate_tokens(*parts) -> int:
     joined = "\n".join(part for part in parts if part)
     return count_words_and_tokens(joined)[1]
 
-def synthesize_combined_analysis(
-    chunk_responses,
-    full_query,
-    model_name,
-    token_budget,
-    total_rows,
-    club_size,
-    consolidation_output_tokens=None,
-    max_levels=6
-) -> str:
-    """
-    Synthesize ALL per-chunk analyses into one overall analysis.
 
-    Important design rules:
-      1. Every chunk is explicitly identified by group number and record range.
-      2. Chunk 1 is NOT treated as the primary context.
-      3. Large collections are reduced hierarchically.
-      4. Every intermediate summary must preserve coverage information.
-      5. The final synthesis must be based on ALL surviving groups.
-      6. Each LLM call is stateless because get_llm_response_direct()
-         uses reset=True.
+def synthesize_combined_analysis(chunk_responses, full_query, model_name,
+                                 token_budget, total_rows, club_size,
+                                 max_levels=6) -> str:
     """
+    ⭐ (v3.1.1.4) Combined analysis pass — synthesises all per-chunk analyses
+    into one final combined analysis.
 
+    ``chunk_responses`` is a list of ``(start_row, end_row, html_text)`` for
+    every chunk that produced a response (row numbers are 1-based, inclusive).
+
+    When the chunk summaries together fit inside ``token_budget`` a single chat
+    call synthesises them (the original v3.1.1.4 behaviour). When they are too
+    large for one call — large datasets that previously fell into the lossy
+    hierarchical + RAG consolidation branch — the summaries are merged in
+    stages:
+      1. partition the summaries into groups whose prompts each fit the model
+      2. reduce every group to one interim analysis via an inline chat call
+      3. merge the interim analyses the same way, recursively, until a single
+         final combined analysis remains
+    This keeps every dataset producing the same per-chunk + combined report
+    regardless of how many records it contains.
+
+    Returns the final combined analysis text (HTML), or "" if nothing could be
+    produced (per-chunk sections are still shown in the report either way).
+    """
     if not chunk_responses or len(chunk_responses) < 2:
         return ""
 
     n_chunks = len(chunk_responses)
 
-    # Use the caller's configured consolidation budget when available.
-    # Fall back to half the combined-analysis threshold.
-    output_budget = (
-        consolidation_output_tokens
-        if consolidation_output_tokens and consolidation_output_tokens > 0
-        else max(token_budget // 2, 500)
-    )
+    def _blocks_desc(level: int) -> str:
+        if level == 0:
+            return (f"The analyses above are the per-chunk analyses of the "
+                    f"complete dataset ({total_rows} records, split into "
+                    f"{n_chunks} chunks of up to {club_size} records each).")
+        return ("The analyses above are interim group analyses; each already "
+                "synthesises several per-chunk analyses, and together they "
+                "cover the complete dataset.")
 
-    print(
-        f"[INFO] Combined synthesis starting: "
-        f"{n_chunks} chunk analyses, "
-        f"{total_rows} records, "
-        f"output budget={output_budget} tokens"
-    )
-
-    def clean_summary(text):
-        """Convert LLM HTML into readable text for the next synthesis pass."""
-        if not text:
-            return ""
-
-        cleaned = html_to_plain_text(text)
-
-        # Prevent pathological whitespace from consuming context.
-        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
-        cleaned = re.sub(r'[ \t]+', ' ', cleaned)
-
-        return cleaned.strip()
-
-    def make_chunk_block(group_num, start, end, html_text):
-        """
-        Create a strongly labelled block.
-
-        The explicit GROUP marker is important because it prevents the LLM
-        from interpreting the first chunk as the main/current context.
-        """
-        text = clean_summary(html_text)
-
-        return (
-            f"=== GROUP {group_num} ===\n"
-            f"RECORD RANGE: {start}-{end}\n"
-            f"GROUP COVERAGE: records {start} through {end}\n"
-            f"GROUP ANALYSIS:\n"
-            f"{text}\n"
-            f"=== END GROUP {group_num} ==="
-        )
-
-    # ------------------------------------------------------------
-    # Build the initial blocks.
-    # ------------------------------------------------------------
-    first_blocks = []
-
-    for group_num, (start, end, html_text) in enumerate(
-        chunk_responses, start=1
-    ):
-        block = make_chunk_block(
-            group_num,
-            start,
-            end,
-            html_text
-        )
-
-        if block:
-            first_blocks.append(block)
-
-    if len(first_blocks) < 2:
-        print("[WARN] Fewer than two usable chunk analyses; skipping combined analysis")
-        return ""
-
-    # ------------------------------------------------------------
-    # Prompt builder
-    # ------------------------------------------------------------
-    def build_prompt(blocks, level, role):
-        all_groups = "\n\n".join(
-            f"[INPUT {idx}]\n{block}"
-            for idx, block in enumerate(blocks, start=1)
-        )
-
+    def _prompt(blocks, role: str, level: int) -> str:
+        numbered = "\n\n".join(f"({i}) {b}" for i, b in enumerate(blocks, 1))
         if role == "interim":
-            task = """
-Create an INTERMEDIATE combined analysis from ALL of the input groups.
-
-IMPORTANT:
-- Every input group must contribute to this analysis.
-- Do NOT use the first group as the primary context.
-- Do NOT ignore later groups.
-- Preserve facts that occur only in one group.
-- Preserve specific locations, formations, units, dates, counts,
-  coordinates, activities and other concrete observations.
-- Identify similarities and differences across the supplied groups.
-- Do not invent information that is not present in the supplied groups.
-- This is only an intermediate synthesis and will be merged with
-  other intermediate syntheses later.
-- State the record/group coverage represented by this synthesis.
-"""
-
+            head = "The analyses above cover only part of the dataset."
+            task = (
+                "Produce an INTERIM combined analysis of ONLY these analyses. "
+                "This output will be merged with other interim analyses later. "
+                "Preserve important evidence and specific details rather than "
+                "generalising them away. In particular, preserve specific "
+                "locations, countries, organizations, units, formations, "
+                "activity types, activity dates/date ranges, counts, equipment, "
+                "infrastructure projects, security concerns and other concrete "
+                "observations when they are present. "
+                "Identify recurring themes or relationships within these analyses, "
+                "but do not treat a finding as a broader dataset-wide pattern "
+                "unless the supplied analyses support that conclusion. "
+                "Distinguish important recurring observations from one-off "
+                "observations. Resolve apparent conflicts cautiously using only "
+                "the supplied analyses; do not invent missing information.")
         else:
-            task = f"""
-Create ONE FINAL OVERALL ANALYSIS of the COMPLETE DATASET.
+            head = _blocks_desc(level)
+            task = (
+                "Synthesise these analyses into ONE evidence-based final combined "
+                "analysis covering the whole dataset. The supplied analyses are the "
+                "only source of evidence; do not introduce facts that are not "
+                "supported by them.\n\n"
 
-The dataset contains {total_rows} records divided into {n_chunks} groups.
+                "The final analysis must:\n"
+                "  - identify the most important patterns and relationships that "
+                "appear across multiple chunks or groups;\n"
+                "  - distinguish genuine whole-dataset patterns from findings "
+                "that occur only in one chunk or group;\n"
+                "  - identify recurring countries, locations, organizations, units, "
+                "formations, activity types, equipment, infrastructure themes and "
+                "security/intelligence themes when supported by the analyses;\n"
+                "  - aggregate counts, frequencies and date ranges only when the "
+                "supplied analyses provide enough information to do so accurately;\n"
+                "  - identify important geographic, temporal or activity-related "
+                "concentrations when supported by the evidence;\n"
+                "  - preserve significant one-off or unusual observations when they "
+                "are important, even if they do not form a recurring pattern;\n"
+                "  - compare similarities and differences between groups where "
+                "they are meaningful;\n"
+                "  - resolve apparent conflicts cautiously and never invent a "
+                "resolution when the supplied analyses do not provide enough "
+                "evidence;\n"
+                "  - avoid repeating the same observation in multiple sections;\n"
+                "  - prioritize specific, evidence-supported findings over generic "
+                "statements about the dataset;\n"
+                "  - avoid unsupported causal claims, assumptions or extrapolations.\n\n"
 
-IMPORTANT:
-- You MUST synthesize ALL supplied groups.
-- Do NOT reproduce Group 1 or any single group as the overall answer.
-- Do NOT treat the first input as more important than later inputs.
-- Look for patterns that emerge ACROSS groups.
-- Aggregate counts and date ranges where the source analyses support it.
-- Identify recurring locations, formations, activities and other patterns.
-- Identify important differences or changes between groups.
-- Preserve important group-specific observations when they materially
-  affect the overall picture.
-- Resolve conflicts cautiously; do not invent facts.
-- The result must represent the COMPLETE dataset, not a single group.
-"""
+                "Do not merely summarize each chunk again. The purpose of this final "
+                "stage is to synthesize the chunks and identify what can be learned "
+                "from considering them together.\n\n"
 
-        return f"""
-{full_query}
+                "Structure the final analysis using these sections:\n"
+                "  - Key Observations\n"
+                "  - Cross-Dataset Patterns\n"
+                "  - Significant Differences and Exceptions\n"
+                "  - Conclusion\n"
+                "Do not create a separate section for each chunk or group."
+            )
+        return (f"{full_query}\n\n{head} {task}\n\n"
+                f"--- Analyses ---\n{numbered}\n\n--- End ---\n\n"
+                f"Output HTML using only h2, p, ul, ol, li, strong and b tags.Every HTML tag must be properly closed. Never leave <strong> or <b> tags unclosed.")
 
-{task}
+    def _prompt_cost(blocks, role: str, level: int) -> int:
+        return _combined_estimate_tokens(_prompt(blocks, role, level))
 
---- BEGIN SYNTHESIS INPUTS ---
-
-{all_groups}
-
---- END SYNTHESIS INPUTS ---
-
-Coverage requirement:
-The output must be based on every supplied input group.
-
-Output only HTML using:
-<h2>, <p>, <ul>, <ol>, <li>, <strong>, <b>
-
-Every HTML tag must be properly closed.
-Do not output markdown.
-"""
-
-    def prompt_cost(blocks, level, role):
-        return _combined_estimate_tokens(
-            build_prompt(blocks, level, role)
-        )
-
-    # ------------------------------------------------------------
-    # LLM call
-    # ------------------------------------------------------------
-    def call_llm(blocks, level, role):
-        prompt = build_prompt(blocks, level, role)
-
-        estimated = _combined_estimate_tokens(prompt)
-
-        print(
-            f"[INFO] Combined synthesis "
-            f"level={level}, role={role}, "
-            f"inputs={len(blocks)}, "
-            f"estimated_tokens={estimated}, "
-            f"output_budget={output_budget}"
-        )
-
+    def _call(blocks, role: str, level: int) -> str:
+        prompt = _prompt(blocks, role, level)
+        print(f"[INFO] Combined synthesis (level {level}, role={role}, "
+              f"{len(blocks)} block(s), ~{_prompt_cost(blocks, role, level)} tokens)")
         response = get_llm_response_direct(
             prompt,
             model_name,
-            max_tokens=output_budget
+            max_tokens=None
         )
-
         if response and len(response.strip()) > 20:
             return response.strip()
-
-        print(
-            f"[WARN] Combined synthesis returned empty/short response "
-            f"at level {level}"
-        )
+        print(f"[WARN] Combined synthesis returned an empty/short response "
+              f"(level {level}); skipping")
         return ""
 
-    # ------------------------------------------------------------
-    # Partition input blocks.
-    #
-    # We deliberately leave more headroom than the old implementation.
-    # This reduces the chance that the LLM effectively attends to only
-    # the beginning of a large prompt.
-    # ------------------------------------------------------------
-    def partition(blocks, level):
+    def _partition(blocks):
+        """Split blocks into consecutive groups whose individual prompts fit the
+        token budget. An oversized single block becomes its own group (the
+        caller drops it rather than overflowing the model)."""
         query_cost = _combined_estimate_tokens(full_query)
-
-        # Reserve substantial space for:
-        #   - instructions
-        #   - group labels
-        #   - separators
-        #   - model response
-        #
-        # The previous implementation used only 500 tokens of overhead.
-        # That was too aggressive for a context-constrained local model.
-        overhead = 1000
-
-        usable_budget = max(
-            token_budget - query_cost - overhead,
-            1000
-        )
-
+        overhead = 500  # instructions + separators + response headroom
+        budget = max(token_budget - query_cost - overhead, 1)
         groups = []
         current = []
         current_cost = 0
-
         for block in blocks:
-            block_cost = _combined_estimate_tokens(block)
-
-            # If adding this block would exceed the usable prompt budget,
-            # close the current group first.
-            if current and current_cost + block_cost > usable_budget:
+            cost = _combined_estimate_tokens(block)
+            if current and current_cost + cost > budget:
                 groups.append(current)
                 current = []
                 current_cost = 0
-
             current.append(block)
-            current_cost += block_cost
-
+            current_cost += cost
         if current:
             groups.append(current)
+        return groups, budget
 
-        print(
-            f"[INFO] Combined synthesis level {level}: "
-            f"{len(blocks)} inputs → {len(groups)} synthesis groups "
-            f"(usable budget ~{usable_budget} tokens)"
-        )
+    def _synthesize(blocks, level: int) -> str:
+        if not blocks or level > max_levels:
+            return ""
+        if len(blocks) == 1 or _prompt_cost(blocks, "final", level) <= token_budget:
+            return _call(blocks, "final", level)
 
-        return groups
-
-    # ------------------------------------------------------------
-    # Recursive hierarchical synthesis
-    # ------------------------------------------------------------
-    def synthesize(blocks, level=0):
-        if not blocks:
-            return []
-
-        if level > max_levels:
-            print(
-                f"[WARN] Maximum combined synthesis depth "
-                f"({max_levels}) reached"
-            )
-            return blocks
-
-        # If everything fits, perform ONE final synthesis.
-        if prompt_cost(blocks, level, "final") <= token_budget:
-            result = call_llm(blocks, level, "final")
-
-            if result:
-                return [result]
-
-            return []
-
-        # Otherwise divide the inputs into manageable groups.
-        groups = partition(blocks, level)
-
+        groups, budget = _partition(blocks)
         merged = []
+        for group in groups:
+            group_cost = _prompt_cost(group, "interim", level)
 
-        for group_idx, group in enumerate(groups, start=1):
+            if group_cost > token_budget and len(group) > 1:
+                midpoint = len(group) // 2
 
-            # A single oversized block cannot safely be sent to the model.
-            if prompt_cost(group, level, "interim") > token_budget:
+                left = _synthesize(group[:midpoint], level)
+                right = _synthesize(group[midpoint:], level)
+
+                if left:
+                    merged.append(left)
+                if right:
+                    merged.append(right)
+                continue
+
+            if group_cost > token_budget:
                 print(
-                    f"[WARN] Synthesis group {group_idx}/{len(groups)} "
-                    f"is still too large "
-                    f"(~{prompt_cost(group, level, 'interim')} tokens). "
-                    f"Skipping this group."
+                    f"[WARN] Combined synthesis: single summary is too large "
+                    f"to merge (~{group_cost} tokens > budget {token_budget}); "
+                    f"skipping this summary"
                 )
                 continue
 
-            partial = call_llm(
-                group,
-                level,
-                "interim"
-            )
-
+            partial = _call(group, "interim", level)
             if partial:
-                merged.append(
-                    f"=== INTERMEDIATE GROUP {group_idx} ===\n"
-                    f"{partial}\n"
-                    f"=== END INTERMEDIATE GROUP {group_idx} ==="
-                )
-
+                merged.append(partial)
         if not merged:
-            print(
-                "[WARN] No intermediate synthesis results were produced"
-            )
-            return []
+            print("[WARN] Combined synthesis could not produce any interim analyses; "
+                  "skipping combined analysis")
+            return ""
+        if len(merged) < 2:
+            print("[WARN] Combined synthesis left a single incomplete analysis; "
+                  "skipping combined analysis")
+            return ""
+        return _synthesize(merged, level + 1)
 
-        # One result means we have only one surviving branch.
-        # Do NOT pretend that it is a complete final analysis.
-        if len(merged) == 1:
-            print(
-                "[WARN] Only one intermediate synthesis survived; "
-                "combined analysis cannot be guaranteed to cover all groups"
-            )
-            return []
+    first_blocks = [
+        f"Records {start}-{end}:\n{html_to_plain_text(html_text)}"
+        for (start, end, html_text) in chunk_responses
+    ]
+    final = _synthesize(first_blocks, 0)
+    if final:
+        print(f"[INFO] Combined analysis response: {len(final)} chars")
+    return final
 
-        # Merge the intermediate analyses recursively.
-        return synthesize(
-            merged,
-            level + 1
+
+def _keep_latest_by_form_id(hits: list) -> list:
+    """For General Analysis, keep only the latest record per form_id."""
+
+    latest_by_form_id = {}
+    records_without_form_id = []
+
+    def _activity_date_key(hit):
+        source = hit.get("_source", {}) if isinstance(hit, dict) else {}
+        value = source.get("activity_date") or source.get("@timestamp") or ""
+
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+            # Treat timezone-less timestamps as UTC.
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+
+            return (1, dt.timestamp())
+
+        except (ValueError, TypeError, OSError):
+            # Invalid/missing dates sort below valid dates.
+            return (0, 0)
+
+    # Collect latest record plus historical equipment/infra values per form_id.
+    equipment_by_form_id = {}
+    infra_by_form_id = {}
+
+    for hit in hits:
+        source = hit.get("_source", {}) if isinstance(hit, dict) else {}
+        form_id = source.get("form_id")
+
+        if form_id in (None, ""):
+            records_without_form_id.append(hit)
+            continue
+
+        key = str(form_id)
+
+        # Collect equipment_name from every record belonging to this form_id.
+        eq_name = (
+            source.get("equipment_name")
+            or source.get("equipment.equipment_name")
         )
 
-    # ------------------------------------------------------------
-    # Start synthesis
-    # ------------------------------------------------------------
-    final_results = synthesize(first_blocks, 0)
+        # Collect infra_name from every record belonging to this form_id.
+        infra_name = (
+            source.get("infra_name")
+            or source.get("infra.infra_name")
+        )
 
-    if not final_results:
-        print("[WARN] Overall combined analysis could not be generated")
-        return ""
+        if eq_name not in (None, "", "None"):
+            equipment_by_form_id.setdefault(key, set()).add(str(eq_name).strip())
 
-    final = final_results[0].strip()
+        if infra_name not in (None, "", "None"):
+            infra_by_form_id.setdefault(key, set()).add(str(infra_name).strip())
+
+        # Keep only the latest record as the base document.
+        current = latest_by_form_id.get(key)
+
+        if current is None or _activity_date_key(hit) > _activity_date_key(current):
+            latest_by_form_id[key] = hit
+
+    # Build final result using the latest document for each form_id.
+    result = []
+
+    for key, latest_hit in latest_by_form_id.items():
+        # Do not modify the original ES hit.
+        final_hit = copy.deepcopy(latest_hit)
+        source = final_hit.get("_source", {})
+
+        # Merge historical + latest equipment values.
+        equipment_values = equipment_by_form_id.get(key, set())
+        if equipment_values:
+            source["equipment_name"] = ", ".join(sorted(equipment_values))
+
+        # Merge historical + latest infra values.
+        infra_values = infra_by_form_id.get(key, set())
+        if infra_values:
+            source["infra_name"] = ", ".join(sorted(infra_values))
+
+        result.append(final_hit)
+
+    result.extend(records_without_form_id)
 
     print(
-        f"[INFO] Overall combined analysis generated: "
-        f"{len(final)} chars from {n_chunks} chunk analyses"
+        f"[INFO] General form_id grouping: "
+        f"{len(hits)} → {len(result)} records"
     )
 
-    return final
+    return result
 
 # ──────────────────────────────────────────────
 # ⭐ Modified: ai_analysis_summary_check with Query Mode
 # ──────────────────────────────────────────────
 def ai_analysis_summary_check(row, ai_trends, ai_summ, ai_change, ai_change_previous, cursor,
-                               chunk_token_threshold=3000, chunk_size=2200,
-                               chunk_output_tokens=800, consolidation_output_tokens=1500):
+                              chunk_token_threshold=3000, chunk_size=2200,
+                              chunk_output_tokens=800, consolidation_output_tokens=1500,
+                              llm_context_tokens=None):
     elastic_query, ai_analysis_summary_id, search_form_type = row
     search_form_type = search_form_type.lower()
     model_prompt_dict = None
     if search_form_type != 'profile analysis':
         model_prompt_dict = get_prompt_and_model(cursor, ai_analysis_summary_id)
 
-    e_response = get_data_from_elastic(elastic_query) if elastic_query else None
-    if e_response and e_response['hits']['total']['value'] > 0:
-        e_hits = e_response['hits']['hits']
-    else:
-        e_hits = []
-    dedup_stats = e_response.get("dedup_stats", {}) if e_response else {}
+        is_general_analysis = (
+            search_form_type in [t.lower() for t in TYPE_MAPPING["general"]["types"]]
+        )
+
+        e_response = get_data_from_elastic(
+            elastic_query,
+            perform_dedup=not is_general_analysis
+        ) if elastic_query else None
+
+        if e_response and e_response['hits']['total']['value'] > 0:
+            e_hits = e_response['hits']['hits']
+        else:
+            e_hits = []
+
+        dedup_stats = e_response.get("dedup_stats", {}) if e_response else {}
+
+        # General Analysis:
+        # 1. Group by form_id.
+        # 2. Keep latest activity_date.
+        # 3. Merge historical equipment/infra values.
+        # 4. ONLY THEN apply the normal deduplication.
+        if is_general_analysis:
+            e_hits = _keep_latest_by_form_id(e_hits)
+
+            e_hits = _dedup_hits(
+                e_hits,
+                [
+                    "description_hash",
+                    "comments",
+                    "location_name",
+                    "activity_type",
+                    "activity_date",
+                    "enemy_formation_name",
+                ]
+            )
 
     ai_change_repsonse = ''
     ai_trend_response = ''
@@ -2110,7 +2116,13 @@ def ai_analysis_summary_check(row, ai_trends, ai_summ, ai_change, ai_change_prev
                         if single_json.get("description"):
                             file_http_path = single_json.get('file_http_path', f'file{index}')
                             index += 1 if 'file_http_path' not in single_json else 0
-                            activity_date = datetime.fromisoformat(single_json['@timestamp']).strftime("%Y-%m-%d")
+                            raw_timestamp = single_json.get("@timestamp", "")
+                            try:
+                                activity_date = datetime.fromisoformat(
+                                    raw_timestamp.replace("Z", "+00:00")
+                                ).strftime("%Y-%m-%d")
+                            except (ValueError, TypeError):
+                                activity_date = ""
                             file_name = file_http_path.split('/')[-1]
                             complete_single_profile = {
                                 "file_path": file_http_path, "file_name": file_name,
@@ -2296,14 +2308,15 @@ def ai_analysis_summary_check(row, ai_trends, ai_summ, ai_change, ai_change_prev
                     combined_html = ""
                     if n_chunks_done > 1:
                         try:
+                            combined_token_budget = int(llm_context_tokens * 0.85)
+
                             combined_response = synthesize_combined_analysis(
                                 chunk_responses,
                                 full_query=full_query,
                                 model_name=model_name,
-                                token_budget=chunk_token_threshold,
+                                token_budget=combined_token_budget,
                                 total_rows=rows_total,
                                 club_size=CLUB_SIZE,
-                                consolidation_output_tokens=consolidation_output_tokens,
                             )
                             if combined_response:
                                 combined_html = (
@@ -2490,16 +2503,18 @@ def extract_date_range(data):
 # Thread-safe wrappers (unchanged from v3.0.0)
 # ──────────────────────────────────────────────
 def ai_analysis_summary_check_threadsafe(row, ai_trends, ai_summ, ai_change, ai_change_previous,
-                                          chunk_token_threshold=3000, chunk_size=2200,
-                                          chunk_output_tokens=800, consolidation_output_tokens=1500):
+                                         chunk_token_threshold=3000, chunk_size=2200,
+                                         chunk_output_tokens=800, consolidation_output_tokens=1500,
+                                         llm_context_tokens=None):
     try:
         conn = postgres_connection()
         with conn.cursor() as cursor:
             filter_json, ai_analysis_summary_id, search_form_type = row
             ai_analysis_summary_check((filter_json, ai_analysis_summary_id, search_form_type),
-                                       ai_trends, ai_summ, ai_change, ai_change_previous, cursor,
-                                       chunk_token_threshold, chunk_size,
-                                       chunk_output_tokens, consolidation_output_tokens)
+                           ai_trends, ai_summ, ai_change, ai_change_previous, cursor,
+                           chunk_token_threshold, chunk_size,
+                           chunk_output_tokens, consolidation_output_tokens,
+                           llm_context_tokens)
         conn.commit()
         conn.close()
     except Exception as e:
@@ -2578,8 +2593,9 @@ def ensure_connection(conn):
 
 
 def run_ai_analysis_summary_loop(ai_trends, ai_summ, ai_change, ai_change_previous, poll_interval,
-                                  chunk_token_threshold=3000, chunk_size=2200,
-                                  chunk_output_tokens=800, consolidation_output_tokens=1500):
+                                 chunk_token_threshold=3000, chunk_size=2200,
+                                 chunk_output_tokens=800, consolidation_output_tokens=1500,
+                                 llm_context_tokens=None):                                
     conn = postgres_connection()
 
     while True:
@@ -2613,7 +2629,8 @@ def run_ai_analysis_summary_loop(ai_trends, ai_summ, ai_change, ai_change_previo
                         chunk_token_threshold,
                         chunk_size,
                         chunk_output_tokens,
-                        consolidation_output_tokens
+                        consolidation_output_tokens,
+                        llm_context_tokens
                     )
                     # p = multiprocessing.Process(target=ai_analysis_summary_check_threadsafe,
                     #                             args=(row, ai_trends, ai_summ, ai_change, ai_change_previous,
@@ -2758,8 +2775,9 @@ def call_main_func():
         sys.exit(1)
     else:
         run_ai_analysis_summary_loop(ai_trends, ai_summ, ai_change, ai_change_previous, poll_interval,
-                                      chunk_token_threshold, chunk_size,
-                                      chunk_output_tokens, consolidation_output_tokens)
+                             chunk_token_threshold, chunk_size,
+                             chunk_output_tokens, consolidation_output_tokens,
+                             llm_context_tokens)
 
 
 if __name__ == '__main__':
