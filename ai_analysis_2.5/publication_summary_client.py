@@ -13,10 +13,9 @@ so the whole publication integration lives in ONE file. API endpoints
     POST /api/v1/publication-qa/questions            submit one question
     GET  /api/v1/publication-qa/questions/{id}       poll until complete/failed
 
-Auth:  NONE. As of Publication Assistant v4.42.3 the /api/v1/publication-qa
-namespace is unauthenticated, so this client sends NO credential. The legacy
-publication_token / SUMMARY_API_TOKEN settings are no longer read. Protect the
-endpoint at the host/reverse-proxy layer instead.
+Auth:  Authorization: Bearer <publication_token>   (constants.py, parent dir).
+The token is read from constants.publication_token, falling back to the
+SUMMARY_API_TOKEN environment variable.
 
 The API searches all publications server-side, so the record data (e_hits,
 filter_json, page_name) is NO longer submitted — the question alone (built
@@ -26,9 +25,9 @@ Behavior contract (unchanged from v3.1.1.15):
   - summary_type_publication is FALSE/NULL  -> section is skipped entirely.
   - summary_type_publication is TRUE        -> ask one question and render the
     answer (bounded, default 240 s).
-  - If the API is unreachable, submission fails, or the wait times out -> the
-    section is skipped (empty string) and the pipeline continues. Report
-    generation NEVER fails because of this section.
+  - If the API is unreachable, the token is missing/invalid, submission fails,
+    or the wait times out -> the section is skipped (empty string) and the
+    pipeline continues. Report generation NEVER fails because of this section.
 
 ⭐ v3.1.1.26 — PUBLICATION READINESS:
 The API snapshots every Ready publication at submission. A publication that is
@@ -51,11 +50,11 @@ question was asked 80 s before the PDF became Ready). The client now:
      retry drops the instruction verb and the language clause
      (“army bases details”).
 
-Base-URL resolution (first hit wins):
-  1. explicit base_url= argument (the main script passes the value it loads
-     from constants.py),
-  2. constants.py (parent dir):  publication_base_url
-  3. environment:                SUMMARY_API_BASE
+Token / base-URL resolution (first hit wins):
+  1. explicit token=/base_url= arguments (the main script passes the values
+     it loads from constants.py),
+  2. constants.py (parent dir):  publication_token / publication_base_url
+  3. environment:                SUMMARY_API_TOKEN / SUMMARY_API_BASE
   4. default base URL:           http://127.0.0.1:8998
 """
 
@@ -96,9 +95,9 @@ USER_AGENT = "ai-analysis-pipeline/1.0"
 
 
 # ---------------------------------------------------------------------------
-# constants.py (parent dir) — primary source for publication_base_url. Loaded
-# with the same importlib pattern the main script uses; any failure falls back
-# to the environment variables.
+# constants.py (parent dir) — primary source for publication_token and
+# publication_base_url. Loaded with the same importlib pattern the main script
+# uses; any failure falls back to the environment variables.
 # ---------------------------------------------------------------------------
 def _load_constants_module():
     path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "constants.py"))
@@ -120,6 +119,13 @@ def _api_base() -> str:
     if not base:
         base = os.getenv("SUMMARY_API_BASE", DEFAULT_PUBLICATION_QA_BASE_URL)
     return base.rstrip("/")
+
+
+def _token() -> str:
+    token = str(getattr(_constants_module, "publication_token", "") or "").strip()
+    if not token:
+        token = (os.getenv("SUMMARY_API_TOKEN") or "").strip()
+    return token
 
 
 def _model_env_override() -> Optional[str]:
@@ -187,6 +193,13 @@ def _retrieval_friendly_question(text: str) -> str:
 
     "List all army bases details Please show result in English language." ->
     "army bases details". Returns '' when nothing meaningful is left.
+
+    ⭐ v3.1.1.27: the publication retriever also treats ANY capitalised leading
+    word as a hard named-entity anchor that must literally occur in a passage,
+    so a prompt such as "Impact of self reliance on defense manufacturing
+    economy" retrieves nothing while "impact …"/"self reliance …" both work.
+    The instruction verbs above cannot cover such nouns, so the leading word is
+    lowercased as a final step.
     """
     cleaned = str(text or "").strip()
     if not cleaned:
@@ -194,17 +207,18 @@ def _retrieval_friendly_question(text: str) -> str:
     cleaned = _LANGUAGE_CLAUSE_RE.sub(" ", cleaned)
     cleaned = _BARE_LANGUAGE_CLAUSE_RE.sub(" ", cleaned)
     cleaned = _LEADING_INSTRUCTION_RE.sub("", cleaned)
-    return re.sub(r"\s{2,}", " ", cleaned).strip(" ,.;:-")
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" ,.;:-")
+    if cleaned and cleaned[0].isupper():
+        cleaned = cleaned[0].lower() + cleaned[1:]
+    return cleaned
 
 
 # ---------------------------------------------------------------------------
 # Publication Assistant v4.42 All-Publications Q&A API client
 # (merged from publication_api_client.py — ⭐ v3.1.1.17)
 # ---------------------------------------------------------------------------
-def _submit_question(base_url, question, model_name=None, timeout=None):
-    """Submit one question to the unauthenticated publication-qa API.
-
-    ⭐ v4.42.3: no Authorization header is sent; the namespace has no auth.
+def _submit_question(base_url, question, model_name=None, timeout=None, token=None):
+    """Authenticate with the Bearer token and submit one question.
 
     Returns:
         question_id (str)
@@ -215,6 +229,8 @@ def _submit_question(base_url, question, model_name=None, timeout=None):
     if model_name:
         payload["model_name"] = model_name
 
+    token = token if token is not None else _token()
+
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
@@ -222,6 +238,8 @@ def _submit_question(base_url, question, model_name=None, timeout=None):
         # Makes a network retry safer by preventing accidental duplicate jobs.
         "Idempotency-Key": str(uuid.uuid4()),
     }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
 
     response = requests.post(url, json=payload, headers=headers, timeout=timeout or HTTP_TIMEOUT)
     response.raise_for_status()
@@ -235,7 +253,7 @@ def _submit_question(base_url, question, model_name=None, timeout=None):
 
 
 def _wait_for_answer(base_url, question_id,
-                     poll_interval=None, max_wait=600, timeout=None):
+                     poll_interval=None, max_wait=600, timeout=None, token=None):
     """Poll the API until the answer is complete or failed.
 
     Returns:
@@ -246,10 +264,14 @@ def _wait_for_answer(base_url, question_id,
         f"/api/v1/publication-qa/questions/{question_id}"
     )
 
+    token = token if token is not None else _token()
+
     headers = {
         "Accept": "application/json",
         "User-Agent": USER_AGENT,
     }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
 
     started = time.monotonic()
 
@@ -279,12 +301,11 @@ def _wait_for_answer(base_url, question_id,
 
 
 def _ask_question(base_url, question, model_name=None,
-                  poll_interval=None, max_wait=600):
+                  poll_interval=None, max_wait=600, token=None):
     """Submit the question, wait for processing, and return the response dict.
 
     The response carries ``answer`` and the ``evidence`` (citation / source)
-    list. No credential is sent: the publication-qa API is unauthenticated as of
-    v4.42.3.
+    list. Authentication uses constants.publication_token (Bearer).
 
     Example:
         result = _ask_question(
@@ -292,10 +313,13 @@ def _ask_question(base_url, question, model_name=None,
             "Summarize the major developments."
         )
     """
+    token = token if token is not None else _token()
+
     question_id = _submit_question(
         base_url=base_url,
         question=question,
         model_name=model_name,
+        token=token,
     )
 
     return _wait_for_answer(
@@ -303,6 +327,7 @@ def _ask_question(base_url, question, model_name=None,
         question_id=question_id,
         poll_interval=poll_interval,
         max_wait=max_wait,
+        token=token,
     )
 
 
@@ -390,22 +415,98 @@ def _absolute_url(base_url: str, path: Optional[str]) -> str:
     return base_url.rstrip("/") + "/" + path.lstrip("/")
 
 
-def _render_publication_sources(evidence, base_url: str, max_items: int = 25) -> str:
+def _source_meta_html(source: dict) -> str:
+    """One-line evidence metadata: block type, section, retrieval, dates."""
+    parts = []
+    block_type = str(source.get("block_type") or "").strip()
+    if block_type:
+        parts.append(f"{block_type} block")
+    section = str(source.get("section") or "").strip()
+    if section:
+        parts.append(f"section: {section}")
+    retrieval = source.get("retrieval")
+    if isinstance(retrieval, (list, tuple)) and retrieval:
+        parts.append("retrieval: " + ", ".join(str(item) for item in retrieval))
+    dates = source.get("dates")
+    if isinstance(dates, (list, tuple)) and dates:
+        parts.append("dates: " + ", ".join(str(item) for item in dates))
+    source_pages = source.get("source_pages")
+    if isinstance(source_pages, (list, tuple)) and len(source_pages) > 1:
+        parts.append("source pages: " + ", ".join(str(item) for item in source_pages))
+    if not parts:
+        return ""
+    meta_text = _html.escape(" \u00b7 ".join(parts))
+    return f'<div class="publication-source-meta">{meta_text}</div>'
+
+
+def _render_source_image(source: dict, base_url: str) -> str:
+    """Render a retrieved source image (``asset_url``) as a figure, or ''."""
+    asset = _absolute_url(base_url, source.get("asset_url"))
+    if not asset or (source.get("block_type") != "image" and not source.get("inline_media")):
+        return ""
+    caption = str(source.get("asset_caption") or "").strip()
+    alt = caption or f"Source image from {source.get('doc_name') or 'publication'}"
+    caption_html = f"<figcaption>{_html.escape(caption)}</figcaption>" if caption else ""
+    return (
+        '<figure class="publication-source-image">'
+        f'<a href="{_html.escape(asset)}" target="_blank" rel="noopener">'
+        f'<img src="{_html.escape(asset)}" alt="{_html.escape(alt)}" loading="lazy">'
+        "</a>"
+        f"{caption_html}</figure>"
+    )
+
+
+def _render_source_table(source: dict) -> str:
+    """Render the retrieved table rows (``table_data``) as an HTML table, or ''."""
+    table_data = source.get("table_data")
+    if not isinstance(table_data, dict):
+        return ""
+    headers = [str(header) for header in (table_data.get("headers") or [])]
+    table_rows = [row for row in (table_data.get("rows") or []) if isinstance(row, (list, tuple))]
+    if not headers or not table_rows:
+        return ""
+    label_parts = [
+        f"Table {table_data['table_index']}" if table_data.get("table_index") else "Source table"
+    ]
+    if source.get("page"):
+        label_parts.append(f"page {source['page']}")
+    label = " \u00b7 ".join(label_parts)
+    head_html = "".join(f"<th>{_html.escape(header)}</th>" for header in headers)
+    body_html = "".join(
+        "<tr>" + "".join(
+            f"<td>{_html.escape(str(cell if cell is not None else ''))}</td>" for cell in row
+        ) + "</tr>"
+        for row in table_rows
+    )
+    return (
+        '<div class="publication-source-table">'
+        f'<div class="publication-source-table-label">{_html.escape(label)}</div>'
+        '<div class="table-scroll"><table>'
+        f"<thead><tr>{head_html}</tr></thead><tbody>{body_html}</tbody>"
+        "</table></div></div>"
+    )
+
+
+def _render_publication_sources(evidence, base_url: str, max_items: Optional[int] = None) -> str:
     """Render the API ``evidence`` list as a numbered 'Publication Sources' block.
 
-    Each source shows its document name, page/section and excerpt, mirroring the
-    evidence cards in the Publication Assistant UI, with Preview/Download links
-    when the API exposes them. Returns '' when there is no usable evidence.
+    Every returned source is rendered in full — document, page range, section,
+    block type, retrieval channels, dates, the retrieved text excerpt, the
+    source image (``asset_url``) and the source table (``table_data``) — plus
+    Preview / Download links when the API exposes them. By default nothing is
+    truncated; pass ``max_items`` to cap the list. Returns '' when there is no
+    usable evidence.
     """
     items = [item for item in (evidence or []) if isinstance(item, dict)]
     if not items:
         return ""
+    shown = items if not max_items else items[:max_items]
     rows = []
     # Numbered with <ol> rather than typed digits: the report's citation
     # sanitizer strips a bare digit that follows a tag, so "1." text would be
     # mangled when citations are disabled. The list order matches the API's
     # 1-based citation_no.
-    for source in items[:max_items]:
+    for source in shown:
         name = _html.escape(str(source.get("doc_name") or "Publication"))
         page = source.get("page")
         page_end = source.get("page_end")
@@ -414,10 +515,18 @@ def _render_publication_sources(evidence, base_url: str, max_items: int = 25) ->
         elif page:
             where = f"page {page}"
         else:
-            where = str(source.get("section") or "").strip()
+            where = ""
         where_html = f' <span class="muted">\u00b7 {_html.escape(where)}</span>' if where else ""
+        attributes = []
+        if source.get("doc_id"):
+            attributes.append(f'data-doc-id="{_html.escape(str(source["doc_id"]))}"')
+        if source.get("chunk_id") is not None:
+            attributes.append(f'data-chunk-id="{_html.escape(str(source["chunk_id"]))}"')
+        attributes_html = (" " + " ".join(attributes)) if attributes else ""
         excerpt = str(source.get("excerpt") or "").strip()
         excerpt_html = f"<blockquote>{_html.escape(excerpt)}</blockquote>" if excerpt else ""
+        image_html = _render_source_image(source, base_url)
+        table_html = _render_source_table(source)
         links = []
         preview = _absolute_url(base_url, source.get("preview_url"))
         if preview:
@@ -429,17 +538,18 @@ def _render_publication_sources(evidence, base_url: str, max_items: int = 25) ->
             f'<div class="publication-source-links">{" &middot; ".join(links)}</div>' if links else ""
         )
         rows.append(
-            '<li class="publication-source">'
-            f"<div><strong>{name}</strong>{where_html}</div>"
-            f"{excerpt_html}{links_html}"
+            f'<li class="publication-source"{attributes_html}>'
+            f'<div class="publication-source-head"><strong>{name}</strong>{where_html}</div>'
+            f"{_source_meta_html(source)}"
+            f"{image_html}{table_html}{excerpt_html}{links_html}"
             "</li>"
         )
     more = (
         f'<p class="muted">Showing {max_items} of {len(items)} sources.</p>'
-        if len(items) > max_items else ""
+        if max_items and len(items) > max_items else ""
     )
     return (
-        "<h3>Publication Sources</h3>"
+        f"<h3>Publication Sources <span class=\"muted\">({len(items)} returned)</span></h3>"
         f'<ol class="publication-sources">{"".join(rows)}</ol>{more}'
     )
 
@@ -464,10 +574,11 @@ def build_publication_summary_section(e_hits: list, user_prompt: str,
     Contract (per v3.1.1.15): called only when summary_type_publication is TRUE
     by the caller. Any failure here yields '' so the report is unaffected.
 
-    ⭐ v4.42.3: no credential is sent (the API dropped Bearer auth), so no
-    publication_token / SUMMARY_API_TOKEN is read. The answer is followed by a
-    "Publication Sources" list rendered from the API's ``evidence`` field so the
-    report shows its citations/sources.
+    The request is authenticated with constants.publication_token as
+    ``Authorization: Bearer <token>``. The answer is followed by a "Publication
+    Sources" list rendered from the API's ``evidence`` field so the report
+    shows its citations/sources in full — text excerpt, source image
+    (``asset_url``) and source table (``table_data``) for every returned item.
     """
     question = (user_prompt or "").strip()
     if question:
@@ -476,8 +587,11 @@ def build_publication_summary_section(e_hits: list, user_prompt: str,
         print("[INFO] Publication summary: empty prompt; section skipped")
         return ""
 
-    # ⭐ v4.42.3: unauthenticated API — no token is resolved or sent.
     resolved_base = (base_url or _api_base()).rstrip("/")
+    token = _token()
+    print(f"[INFO] Publication summary: asking {resolved_base} (token={'set' if token else 'missing'})")
+    if not token:
+        print("[WARN] Publication summary: no publication_token in constants.py / SUMMARY_API_TOKEN; sending unauthenticated request")
     max_wait = int(timeout_seconds or os.getenv("SUMMARY_API_TIMEOUT", DEFAULT_SUMMARY_API_TIMEOUT))
 
     # ⭐ v3.1.1.26: a newly uploaded publication is still embedding when a row is
@@ -506,6 +620,7 @@ def build_publication_summary_section(e_hits: list, user_prompt: str,
                 question=question_used,
                 model_name=_model_env_override(),
                 max_wait=max_wait,
+                token=token,
             )
         except Exception as exc:
             print(f"[WARN] Publication summary section skipped due to error: {exc}")
@@ -569,10 +684,10 @@ def build_publication_summary_section(e_hits: list, user_prompt: str,
 
     sources_html = _render_publication_sources(result.get("evidence"), resolved_base)
 
-    section = (
-        f"<h2>{SUMMARY_SECTION_TITLE}</h2>"
-        f"<div class=\"publication-summary\">{answer_html}{sources_html}</div>"
-    )
+    # ⭐ v3.1.1.27: no <h2> here — the report's build_tabbed_html already wraps
+    # this section in a "Publication Summary" heading, and emitting a second
+    # one printed the title twice in every generated report.
+    section = f"<div class=\"publication-summary\">{answer_html}{sources_html}</div>"
     evidence_count = len(result.get("evidence") or []) if isinstance(result.get("evidence"), list) else 0
     print(
         f"[INFO] Publication summary section built ({len(section)} chars, "
