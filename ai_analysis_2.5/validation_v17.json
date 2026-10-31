@@ -1,0 +1,183 @@
+{
+  "version": "3.1.1.17",
+  "date": "2026-10-31",
+  "regression_tests": {
+    "local": 29,
+    "pyspark_container": 29,
+    "status": "PASS"
+  },
+  "stored_request_validation": {
+    "checked": 674,
+    "errors": 0,
+    "analysis_types": 10,
+    "table_cases": 38,
+    "custom_prompt_cases": 40,
+    "stored_flag_combinations": 7
+  },
+  "live_validation": {
+    "unique_cases": 17,
+    "passed": 14,
+    "failed": 0,
+    "dependency_blocked": 3,
+    "all_original_rows_restored": true,
+    "sample_scope": "One real matching ES document per standard case; original four-record table for table case",
+    "cases": [
+      {
+        "id": 2016,
+        "case": "general",
+        "status": "PASS",
+        "seconds": 51.7,
+        "report_bytes": 18714,
+        "publication_dependency_unavailable": false
+      },
+      {
+        "id": 1933,
+        "case": "event_training",
+        "status": "PASS",
+        "seconds": 33.6,
+        "report_bytes": 15550,
+        "publication_dependency_unavailable": false
+      },
+      {
+        "id": 1931,
+        "case": "training",
+        "status": "PASS",
+        "seconds": 32.7,
+        "report_bytes": 14426,
+        "publication_dependency_unavailable": false
+      },
+      {
+        "id": 1926,
+        "case": "event_general",
+        "status": "PASS",
+        "seconds": 41.7,
+        "report_bytes": 17105,
+        "publication_dependency_unavailable": false
+      },
+      {
+        "id": 1870,
+        "case": "force",
+        "status": "PASS",
+        "seconds": 39.3,
+        "report_bytes": 16272,
+        "publication_dependency_unavailable": false
+      },
+      {
+        "id": 1860,
+        "case": "event_force",
+        "status": "PASS",
+        "seconds": 38.3,
+        "report_bytes": 16285,
+        "publication_dependency_unavailable": false
+      },
+      {
+        "id": 1803,
+        "case": "search_by_query",
+        "status": "PASS",
+        "seconds": 84.4,
+        "report_bytes": 8639,
+        "publication_dependency_unavailable": false
+      },
+      {
+        "id": 1781,
+        "case": "infrastructure",
+        "status": "PASS",
+        "seconds": 16.7,
+        "report_bytes": 7772,
+        "publication_dependency_unavailable": false
+      },
+      {
+        "id": 1292,
+        "case": "sitrep",
+        "status": "PASS",
+        "seconds": 9.3,
+        "report_bytes": 7601,
+        "publication_dependency_unavailable": false
+      },
+      {
+        "id": 1207,
+        "case": "profile",
+        "status": "PASS",
+        "seconds": 23.1,
+        "report_bytes": 7700,
+        "publication_dependency_unavailable": false
+      },
+      {
+        "id": 1941,
+        "case": "table",
+        "status": "PASS",
+        "seconds": 7.9,
+        "report_bytes": 9520,
+        "publication_dependency_unavailable": false
+      },
+      {
+        "id": 2003,
+        "case": "custom",
+        "status": "PASS",
+        "seconds": 23.2,
+        "report_bytes": 12081,
+        "publication_dependency_unavailable": false
+      },
+      {
+        "id": 2017,
+        "case": "publication_unavailable",
+        "status": "DEPENDENCY_BLOCKED",
+        "seconds": 52.4,
+        "report_bytes": 19128,
+        "publication_dependency_unavailable": true
+      },
+      {
+        "id": 1919,
+        "case": "citations_publication",
+        "status": "DEPENDENCY_BLOCKED",
+        "seconds": 12.3,
+        "report_bytes": 11410,
+        "publication_dependency_unavailable": true
+      },
+      {
+        "id": 1846,
+        "case": "citations",
+        "status": "PASS",
+        "seconds": 27.5,
+        "report_bytes": 10155,
+        "publication_dependency_unavailable": false
+      },
+      {
+        "id": 2016,
+        "case": "chunks_enabled",
+        "status": "PASS",
+        "seconds": 56.2,
+        "report_bytes": 20321,
+        "publication_dependency_unavailable": false
+      },
+      {
+        "id": 2006,
+        "case": "custom_publication",
+        "status": "DEPENDENCY_BLOCKED",
+        "seconds": 9.5,
+        "report_bytes": 9239,
+        "publication_dependency_unavailable": true
+      }
+    ],
+    "sampling_correction": "Initial citation case selected a document outside requested equipment scope; rerun selected an in-scope document and passed."
+  },
+  "publication": {
+    "constants_file": "/app/constants.py",
+    "same_file_as_worker": true,
+    "token_source": "publication_token",
+    "token_revealed": false,
+    "base_url": "http://192.168.1.16:8999",
+    "authentication": "Confirmed successful with supplied token",
+    "content_generation": "BLOCKED",
+    "error": "CUDA was requested, but PyTorch cannot access a CUDA device (torch 2.14.1+cu130, CUDA build 13.0)."
+  },
+  "deployment": {
+    "container": "pyspark",
+    "worker": "ai_analysis_summary_v3.1.1.17_rag.py",
+    "launcher": "start_ai_summary.sh",
+    "running": true,
+    "v16_preserved": true,
+    "historical_processing_rows_unchanged": 14
+  },
+  "source_sha256": "132273929694deffa6c324bcf80bfa40838a922f7937908a4fc1c69289790b54"
+}

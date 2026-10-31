@@ -2,7 +2,7 @@
 # ──────────────────────────────────────────────
 # start_ai_summary.sh — run the AI summary pipeline in the background.
 #
-# Starts ai_analysis_summary_v3.1.1.16_rag.py with --ai_summary only,
+# Starts ai_analysis_summary_v3.1.1.17_rag.py with --ai_summary only,
 # as a nohup background process with timestamped log output and a pid file.
 #
 # Usage:
@@ -16,7 +16,7 @@
 # ──────────────────────────────────────────────
 set -u
 
-SCRIPT="ai_analysis_summary_v3.1.1.16_rag.py"
+SCRIPT="ai_analysis_summary_v3.1.1.17_rag.py"
 PID_FILE="logs/prod_ai_summary.pid"
 LOG_DIR="logs"
 # LLM context window for the configured model (gemma2:9b = 8192).
